@@ -58,11 +58,15 @@ async def main():
                 response = ollama_client.chat(
                     model=MODEL_NAME,
                     messages=messages,
-                    tools=ollama_tools
+                    tools=ollama_tools,
+                    options={"num_ctx": 16384, "temperature": 0.1} # Forces a larger memory buffer
                 )
                 
                 # Check if the model decided to call an MCP tool
                 if response.message.tool_calls:
+                    # Append the model's intent to call the tool to history first
+                    messages.append(response.message)
+                    
                     for tool_call in response.message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = tool_call.function.arguments
@@ -72,18 +76,29 @@ async def main():
                         # Execute the tool via MCP Session
                         result = await session.call_tool(tool_name, arguments=tool_args)
                         
-                        # Add the tool execution back to the LLM conversation history
-                        messages.append(response.message)
+                        # Extract string representation from MCP response content items
+                        result_text = "".join([getattr(item, 'text', str(item)) for item in result.content])
+                        
+                        # Add the tool execution result back to the LLM conversation history
                         messages.append({
                             "role": "tool",
-                            "content": str(result.content),
+                            "content": result_text,
                             "name": tool_name
                         })
                         
-                    # Get final response from Ollama after receiving tool data
-                    final_response = ollama_client.chat(model=MODEL_NAME, messages=messages)
+                    # FIX: Get final response and reference 'final_response' instead of 'response'
+                    final_response = ollama_client.chat(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        options={"num_ctx": 16384}
+                    )
                     console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                    console.print(Markdown(response.message.content))
+                    console.print(Markdown(final_response.message.content or "*Executed tool successfully but returned no commentary.*"))
+                    messages.append(final_response.message)
+                else:
+                    # Standard conversational response
+                    console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
+                    console.print(Markdown(response.message.content or "No response context found."))
                     messages.append(response.message)
 
 if __name__ == "__main__":
