@@ -171,78 +171,48 @@ async def main():
             
             # Format MCP tools into the structural format Ollama expects
             ollama_tools = []
-            for tool in mcp_tools.tools:
-                ollama_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema
-                    }
-                })
             
             # System prompt optimized for a terminal developer environment
             messages = [{
                 "role": "system",
-                "content": "You are an elite terminal-based pair programmer. You have access to filesystem tools. Use them to view, edit, or create files when requested. Be concise, direct, and output production-ready code."
+                "content": (
+                    "You are an elite terminal-based pair programmer."
+                    "You have access to filesystem tools."
+                    "Use them to view, edit, or create files when requested."
+                    "Be concise, direct, and output production-ready code."
+                    )
             }]
             
-            console.print(Panel("[bold green]Local Coding Partner Initialized![/bold green]\nType your prompt below. Type 'exit' to quit.", title="System"))
+            console.print(Panel(
+                    "[bold green]Local Coding Partner — Multi-Agent Edition[/bold green]\n"
+                    "Normal chat mode is active by default.\n"
+                    "Prefix your request with [bold]--review[/bold] to invoke "
+                    "Writer → Reviewer pipeline.\n"
+                    "Type [bold]exit[/bold] to quit.",
+                    title="System"
+            ))
             
             # Interactive Terminal Loop
             while True:
-                user_input = console.input("\n[bold blue]You:[/bold blue]")
-                if user_input.lower() in ["exit", "quit"]:
+                raw = console.input("\n[bold blue]You:[/bold blue]")
+                if raw.lower().strip() in ("exit", "quit"):
                     break
                 
-                messages.append({"role": "user", "content": user_input})
+                # Review Mode
+                if raw.lstrip().startswith("--review"):
+                    user_request = raw.lstrip().removeprefix("--review").strip()
+                    if not user_request:
+                        console.print("[yellow]Please describe what you want to build.[/yellow]")
+                        continue
+                    await review_mode(session, ollama_tools, user_request)
+                    continue
                 
-                # Call Ollama
-                response = ollama_client.chat(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    tools=ollama_tools,
-                    options={"num_ctx": 16384, "temperature": 0.1} # Forces a larger memory buffer
-                )
+                # Normal conversational/agentic mode
+                messages.append({"role": "user", "content": raw})
                 
-                # Check if the model decided to call an MCP tool
-                if response.message.tool_calls:
-                    # Append the model's intent to call the tool to history first
-                    messages.append(response.message)
-                    
-                    for tool_call in response.message.tool_calls:
-                        tool_name = tool_call.function.name
-                        tool_args = tool_call.function.arguments
-                        
-                        console.print(f"[yellow]⚡ Agent calling tool '{tool_name}' with args: {tool_args}[/yellow]")
-                        
-                        # Execute the tool via MCP Session
-                        result = await session.call_tool(tool_name, arguments=tool_args)
-                        
-                        # Extract string representation from MCP response content items
-                        result_text = "".join([getattr(item, 'text', str(item)) for item in result.content])
-                        
-                        # Add the tool execution result back to the LLM conversation history
-                        messages.append({
-                            "role": "tool",
-                            "content": result_text,
-                            "name": tool_name
-                        })
-                        
-                    # FIX: Get final response and reference 'final_response' instead of 'response'
-                    final_response = ollama_client.chat(
-                        model=MODEL_NAME,
-                        messages=messages,
-                        options={"num_ctx": 16384}
-                    )
-                    console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                    console.print(Markdown(final_response.message.content or "*Executed tool successfully but returned no commentary.*"))
-                    messages.append(final_response.message)
-                else:
-                    # Standard conversational response
-                    console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                    console.print(Markdown(response.message.content or "No response context found."))
-                    messages.append(response.message)
+                response_text = await _run_tool_loop(session, ollama_tools, messages, CHAT_MODEL, "Chat")
+                console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
+                console.print(Markdown(response_text or "No response."))
 
 if __name__ == "__main__":
     asyncio.run(main())
