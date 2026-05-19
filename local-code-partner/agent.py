@@ -1,7 +1,7 @@
 import asyncio
 import os
 from ollama import Client
-from mcp import ClientSession, StdioServerParameters
+from mcp import Clientsessions, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from rich.console import Console
 from rich.markdown import Markdown
@@ -15,10 +15,17 @@ WRITER_MODEL = "qwen2.5-coder:3b"
 REVIEWER_MODEL = "qwen2.5-coder:3b"
 CHAT_MODEL = "qwen2.5-coder:3b"
 
+MAX_HEAL_ROUNDS = 5 # max write->output cycles before giving up
+
 # Define the MCP Server parameters
 server_params = StdioServerParameters(
     command="npx",
     args=["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()]
+)
+
+bash_server_params = StdioServerParameters(
+    command="python3",
+    args=["bash_mcp_server.py"] # live alongside this file
 )
 
 # --HELPER FUNCTIONS-- #
@@ -36,7 +43,17 @@ def _tool_schema(mcp_tools):
         for tool in mcp_tools.tools
     ]
 
-async def _run_tool_loop(session: ClientSession, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> str:
+def _merge_tools(*schemas: list) -> list:
+    seen, merged = set(), []
+    for schema in schemas:
+        for tool in schema:
+            name = tool["function"]["name"]
+            if name not in seen:
+                seen.add(name)
+                merged.append(tool)
+    return merged
+    
+async def _run_tool_loop(sessions: Clientsessions, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> str:
     """
     Drive a single agent through up to 'max_rounds' of tool-call cycles.
     Returns the agent's final text response.
@@ -61,7 +78,7 @@ async def _run_tool_loop(session: ClientSession, ollama_tools: list, messages: l
             args = tc.function.arguments
             console.print(f"[yellow]⚡ [{label}] calling '{name}' → {args}[/yellow]")
             try:
-                result = await session.call_tool(name, arguments=args)
+                result = await sessions.call_tool(name, arguments=args)
                 result_text = "".join(getattr(item, "text", str(item)) for item in result.content)
             except Exception as exc:
                 result_text = f"Tool error: {exc}"
@@ -74,7 +91,7 @@ async def _run_tool_loop(session: ClientSession, ollama_tools: list, messages: l
     return final.message.content or ""
 
 # -- WRITER AGENT -- #
-async def run_writer(session, ollama_tools, user_request: str) -> str:
+async def run_writer(sessions, ollama_tools, user_request: str) -> str:
     """
     Writer Agent: Generates code and save it to disk via MCP.
     Returns the filename it saved.
@@ -94,13 +111,13 @@ async def run_writer(session, ollama_tools, user_request: str) -> str:
         },
         {"role": "user", "content": user_request}
     ]
-    response_text = await _run_tool_loop(session, ollama_tools, messages, WRITER_MODEL, "Writer")
+    response_text = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, "Writer")
     console.print("\n[bold cyan]Writer:[/bold cyan]")
     console.print(Markdown(response_text or "No commentary."))
     return response_text # Caller will extract filename
 
 # -- REVIEWER AGENT -- #
-async def run_reviewer(session, ollama_tools, filename: str) -> None:
+async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
     """
     Reviewer Agent: Read the written file, critique it, write a .review.md file.
     """
@@ -128,11 +145,73 @@ async def run_reviewer(session, ollama_tools, filename: str) -> None:
             "content": f"Please review the file: {filename}"
         }
     ]
-    response_text = await _run_tool_loop(session, ollama_tools, messages, REVIEWER_MODEL, "Reviewer")
+    response_text = await _run_tool_loop(sessions, ollama_tools, messages, REVIEWER_MODEL, "Reviewer")
     
     console.print("\n[bold magenta]Reviewer:[/bold magenta]")
     console.print(Markdown(response_text or "*No commentary.*"))
     console.print(f"\n[green]✓ Review saved to [bold]{review_file}[/bold][/green]")
+
+async def run_execute_heal(sessionss, ollama_tools, filename: str, run_cmd: str) -> None:
+    """
+    Self-healing loop:
+    1. Run the script with run_command.
+    2. If exit code != 0, feed the error back to the Writer to patch the file.
+    3. Repeat up to MAX_HEAL_ROUNDS times.
+    """
+    console.print(Rule("[bold green]Executor + Self-Heal loop[/bold green]"))
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an autonomous debugging engineer. "
+                "Use run_command to execute the script. "
+                "If it fails (non-zero exit code), read the error output carefully, "
+                "use read_file to inspect the code, then use write_file to patch exactly "
+                "the broken lines. Do NOT rewrite the entire file unless necessary. "
+                "After patching, run the command again. "
+                f"Repeat until exit code is 0 or you have tried {MAX_HEAL_ROUNDS} times. "
+                "Give a concise summary of what was fixed when done."
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Script: {filename}\n"
+                f"Run command: {run_cmd}\n\n"
+                "Start by running the command and report the result."
+            )
+        }
+    ]
+    
+    for attempt in range(1, MAX_HEAL_ROUNDS + 1):
+        console.print(f"\n[dim]── Attempt {attempt}/{MAX_HEAL_ROUNDS} ──[/dim]")
+        output = await _run_tool_loop(sessionss, ollama_tools, messages, WRITER_MODEL, f"Heal-{attempt}", max_rounds=4)
+        console.print(Markdown(output or ""))
+        
+        last_tool_results = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
+        if last_tool_results and "Exit code: 0" in last_tool_results[-1]["content"]:
+            console.print(Panel(f"[bold green]✓ Script ran successfully after {attempt} attempt(s).[/bold green]", title="Self-Heal"))
+            return
+        
+        messages.append({
+            "role": "user",
+            "content": "Still failing. Patch the code and run it again."
+        })
+        
+        console.print(Panel(f"[bold red]✗ Still failing after {MAX_HEAL_ROUNDS} attempts.[/bold red]\n"
+            "Check the error output above for manual inspection.", title="Self-Heal"))
+
+async def run_mode(sessionss, ollama_tools, user_request: str) -> None:
+    writer_output = await run_writer(sessionss, ollama_tools, user_request)
+    filename = _extract_filename(writer_output)
+    if not filename:
+        console.print("[red]Could not determine the filename from Writer response.[/red]")
+        return
+
+    run_cmd = f"python3 {filename}"
+    console.print(f"\n[dim]Running [bold]{run_cmd}[/bold]…[/dim]")
+    await run_execute_heal(sessionss, ollama_tools, filename, run_cmd)
 
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
@@ -147,8 +226,8 @@ def _extract_filename(writer_text: str) -> str | None:
             return cleaned
     return None
 
-async def review_mode(session, ollama_tools, user_request: str) -> None:
-    writer_output = await run_writer(session, ollama_tools, user_request)
+async def review_mode(sessions, ollama_tools, user_request: str) -> None:
+    writer_output = await run_writer(sessions, ollama_tools, user_request)
     
     filename = _extract_filename(writer_output)
     if not filename:
@@ -156,37 +235,41 @@ async def review_mode(session, ollama_tools, user_request: str) -> None:
         return
 
     console.print(f"\n[dim]Writer saved: [bold]{filename}[/bold]. Handing off to Reviewer…[/dim]")
-    await run_reviewer(session, ollama_tools, filename)
+    await run_reviewer(sessions, ollama_tools, filename)
     
     
 async def main():
     # Establish connection to MCP Server
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-
-            # Fetch tools exposed by the MCP Server
-            mcp_tools = await session.list_tools()
+    async with stdio_client(server_params) as (read_stream, write_stream), \
+            stdio_client(bash_server_params) as (bash_read, bash_write):
             
-            # Format MCP tools into the structural format Ollama expects
-            ollama_tools = _tool_schema(mcp_tools)
+        async with Clientsessions(read_stream, write_stream) as sessions, \
+                Clientsessions(bash_read, bash_write) as bash_sessions:
+                    
+            await sessions.initialize()
+            await bash_sessions.initialize()
+            
+            sessionss = {"fs": sessions, "bash": bash_sessions}
+            
+            fs_tools   = _tool_schema(await sessions.list_tools())
+            bash_tools = _tool_schema(await bash_sessions.list_tools())
+            all_tools  = _merge_tools(fs_tools, bash_tools)
             
             # System prompt optimized for a terminal developer environment
             messages = [{
                 "role": "system",
                 "content": (
-                    "You are an elite terminal-based pair programmer."
-                    "You have access to filesystem tools."
-                    "Use them to view, edit, or create files when requested."
-                    "Be concise, direct, and output production-ready code."
+                    "You are an elite terminal-based pair programmer with access to "
+                    "filesystem tools (read/write files) and a bash execution tool "
+                    "(run shell commands). Use them freely. Be concise and direct."
                     )
             }]
             
             console.print(Panel(
-                    "[bold green]Local Coding Partner — Multi-Agent Edition[/bold green]\n"
-                    "Normal chat mode is active by default.\n"
-                    "Prefix your request with [bold]--review[/bold] to invoke "
-                    "Writer → Reviewer pipeline.\n"
+                    "[bold green]Local Coding Partner — Bash Sandbox Edition[/bold green]\n\n"
+                    "[bold]--review[/bold]〈request〉→ Writer → Reviewer pipeline\n"
+                    "[bold]--run[/bold]〈request〉→ Write → Execute → Self-Heal loop\n"
+                    "Normal input → conversational agent\n\n"
                     "Type [bold]exit[/bold] to quit.",
                     title="System"
             ))
@@ -203,15 +286,23 @@ async def main():
                     if not user_request:
                         console.print("[yellow]Please describe what you want to build.[/yellow]")
                         continue
-                    await review_mode(session, ollama_tools, user_request)
+                    await review_mode(sessions, all_tools, user_request)
                     continue
                 
-                # Normal conversational/agentic mode
-                messages.append({"role": "user", "content": raw})
+                elif raw.startswith("--run"):
+                    request = raw.removeprefix("--run").strip()
+                    if not request:
+                        console.print("[yellow]Usage: --run <what to build>[/yellow]")
+                        continue
+                    await run_mode(sessions, all_tools, request)
                 
-                response_text = await _run_tool_loop(session, ollama_tools, messages, CHAT_MODEL, "Chat")
-                console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                console.print(Markdown(response_text or "No response."))
+                else:
+                    # Normal conversational/agentic mode
+                    messages.append({"role": "user", "content": raw})
+                    output = await _run_tool_loop(sessions, all_tools, messages, CHAT_MODEL, "Chat")
+                    
+                    console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
+                    console.print(Markdown(output or "No response."))
 
 if __name__ == "__main__":
     asyncio.run(main())
