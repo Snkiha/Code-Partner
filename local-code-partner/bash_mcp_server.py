@@ -124,9 +124,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         parts = shlex.split(command)
     except ValueError as exc:
-        return [TextContent(type="text", text="Error parsing command: {exc}")]
+        return [TextContent(type="text", text=f"Error parsing command: {exc}")]
     
-    executable = Path(parts[0].name) # strip any path prefix
+    executable = Path(parts[0]).name # strip any path prefix
     if not ALLOW_ALL and executable not in ALLOWED_COMMANDS:
         allowed_list = ", ".join(sorted(ALLOWED_COMMANDS))
         return [TextContent(
