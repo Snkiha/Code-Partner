@@ -11,7 +11,6 @@ from rich.rule import Rule
 console = Console()
 ollama_client = Client()
 
-MODEL_NAME = "qwen2.5-coder:3b"
 WRITER_MODEL = "qwen2.5-coder:3b"
 REVIEWER_MODEL = "qwen2.5-coder:3b"
 CHAT_MODEL = "qwen2.5-coder:3b"
@@ -170,7 +169,7 @@ async def main():
             mcp_tools = await session.list_tools()
             
             # Format MCP tools into the structural format Ollama expects
-            ollama_tools = []
+            ollama_tools = _tool_schema(mcp_tools)
             
             # System prompt optimized for a terminal developer environment
             messages = [{
