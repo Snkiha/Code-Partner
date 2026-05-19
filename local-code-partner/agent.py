@@ -1,7 +1,7 @@
 import asyncio
 import os
 from ollama import Client
-from mcp import Clientsessions, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from rich.console import Console
 from rich.markdown import Markdown
@@ -52,8 +52,17 @@ def _merge_tools(*schemas: list) -> list:
                 seen.add(name)
                 merged.append(tool)
     return merged
-    
-async def _run_tool_loop(sessions: Clientsessions, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> str:
+
+async def _call_tool(sessions: dict, name: str, args: dict) -> str:
+    for session in sessions.values():
+        try:
+            result = await session.call_tool(name, arguments=args)
+            return "".join(getattr(item, "text", str(item)) for item in result.content)
+        except Exception:
+            continue
+    return f"Error: no session could handle tool '{name}'"
+
+async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> str:
     """
     Drive a single agent through up to 'max_rounds' of tool-call cycles.
     Returns the agent's final text response.
@@ -78,8 +87,7 @@ async def _run_tool_loop(sessions: Clientsessions, ollama_tools: list, messages:
             args = tc.function.arguments
             console.print(f"[yellow]⚡ [{label}] calling '{name}' → {args}[/yellow]")
             try:
-                result = await sessions.call_tool(name, arguments=args)
-                result_text = "".join(getattr(item, "text", str(item)) for item in result.content)
+                result_text = await _call_tool(sessions, name, args)
             except Exception as exc:
                 result_text = f"Tool error: {exc}"
                 console.print(f"[red]Tool error: {exc}[/red]")
@@ -151,7 +159,7 @@ async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
     console.print(Markdown(response_text or "*No commentary.*"))
     console.print(f"\n[green]✓ Review saved to [bold]{review_file}[/bold][/green]")
 
-async def run_execute_heal(sessionss, ollama_tools, filename: str, run_cmd: str) -> None:
+async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) -> None:
     """
     Self-healing loop:
     1. Run the script with run_command.
@@ -186,9 +194,10 @@ async def run_execute_heal(sessionss, ollama_tools, filename: str, run_cmd: str)
     
     for attempt in range(1, MAX_HEAL_ROUNDS + 1):
         console.print(f"\n[dim]── Attempt {attempt}/{MAX_HEAL_ROUNDS} ──[/dim]")
-        output = await _run_tool_loop(sessionss, ollama_tools, messages, WRITER_MODEL, f"Heal-{attempt}", max_rounds=4)
-        console.print(Markdown(output or ""))
+        output = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, f"Heal-{attempt}", max_rounds=4)
         
+        console.print(Markdown(output or ""))
+            
         last_tool_results = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
         if last_tool_results and "Exit code: 0" in last_tool_results[-1]["content"]:
             console.print(Panel(f"[bold green]✓ Script ran successfully after {attempt} attempt(s).[/bold green]", title="Self-Heal"))
@@ -198,12 +207,12 @@ async def run_execute_heal(sessionss, ollama_tools, filename: str, run_cmd: str)
             "role": "user",
             "content": "Still failing. Patch the code and run it again."
         })
-        
-        console.print(Panel(f"[bold red]✗ Still failing after {MAX_HEAL_ROUNDS} attempts.[/bold red]\n"
-            "Check the error output above for manual inspection.", title="Self-Heal"))
+    
+    console.print(Panel(f"[bold red]✗ Still failing after {MAX_HEAL_ROUNDS} attempts.[/bold red]\n"
+        "Check the error output above for manual inspection.", title="Self-Heal"))
 
-async def run_mode(sessionss, ollama_tools, user_request: str) -> None:
-    writer_output = await run_writer(sessionss, ollama_tools, user_request)
+async def run_mode(sessions, ollama_tools, user_request: str) -> None:
+    writer_output = await run_writer(sessions, ollama_tools, user_request)
     filename = _extract_filename(writer_output)
     if not filename:
         console.print("[red]Could not determine the filename from Writer response.[/red]")
@@ -211,7 +220,7 @@ async def run_mode(sessionss, ollama_tools, user_request: str) -> None:
 
     run_cmd = f"python {filename}"
     console.print(f"\n[dim]Running [bold]{run_cmd}[/bold]…[/dim]")
-    await run_execute_heal(sessionss, ollama_tools, filename, run_cmd)
+    await run_execute_heal(sessions, ollama_tools, filename, run_cmd)
 
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
@@ -239,22 +248,21 @@ async def review_mode(sessions, ollama_tools, user_request: str) -> None:
     
     
 async def main():
-    # Establish connection to MCP Server
     async with stdio_client(server_params) as (read_stream, write_stream), \
             stdio_client(bash_server_params) as (bash_read, bash_write):
-            
-        async with Clientsessions(read_stream, write_stream) as sessions, \
-                Clientsessions(bash_read, bash_write) as bash_sessions:
-                    
-            await sessions.initialize()
-            await bash_sessions.initialize()
-            
-            sessionss = {"fs": sessions, "bash": bash_sessions}
-            
-            fs_tools   = _tool_schema(await sessions.list_tools())
-            bash_tools = _tool_schema(await bash_sessions.list_tools())
+
+        async with ClientSession(read_stream, write_stream) as fs_session, \
+                ClientSession(bash_read, bash_write) as bash_session:
+
+            await fs_session.initialize()
+            await bash_session.initialize()
+
+            all_sessions = {"fs": fs_session, "bash": bash_session}
+
+            fs_tools   = _tool_schema(await fs_session.list_tools())
+            bash_tools = _tool_schema(await bash_session.list_tools())
             all_tools  = _merge_tools(fs_tools, bash_tools)
-            
+        
             # System prompt optimized for a terminal developer environment
             messages = [{
                 "role": "system",
@@ -286,7 +294,7 @@ async def main():
                     if not user_request:
                         console.print("[yellow]Please describe what you want to build.[/yellow]")
                         continue
-                    await review_mode(sessions, all_tools, user_request)
+                    await review_mode(all_sessions, all_tools, user_request)
                     continue
                 
                 elif raw.startswith("--run"):
@@ -294,12 +302,12 @@ async def main():
                     if not request:
                         console.print("[yellow]Usage: --run <what to build>[/yellow]")
                         continue
-                    await run_mode(sessions, all_tools, request)
+                    await run_mode(all_sessions, all_tools, request)
                 
                 else:
                     # Normal conversational/agentic mode
                     messages.append({"role": "user", "content": raw})
-                    output = await _run_tool_loop(sessions, all_tools, messages, CHAT_MODEL, "Chat")
+                    output = await _run_tool_loop(all_sessions, all_tools, messages, CHAT_MODEL, "Chat")
                     
                     console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
                     console.print(Markdown(output or "No response."))
