@@ -24,7 +24,7 @@ server_params = StdioServerParameters(
 )
 
 bash_server_params = StdioServerParameters(
-    command="python3",
+    command="python",
     args=["bash_mcp_server.py"] # live alongside this file
 )
 
@@ -209,7 +209,7 @@ async def run_mode(sessionss, ollama_tools, user_request: str) -> None:
         console.print("[red]Could not determine the filename from Writer response.[/red]")
         return
 
-    run_cmd = f"python3 {filename}"
+    run_cmd = f"python {filename}"
     console.print(f"\n[dim]Running [bold]{run_cmd}[/bold]…[/dim]")
     await run_execute_heal(sessionss, ollama_tools, filename, run_cmd)
 
