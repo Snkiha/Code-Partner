@@ -11,8 +11,8 @@ from rich.rule import Rule
 console = Console()
 ollama_client = Client()
 
-WRITER_MODEL = "qwen2.5-coder:3b"
-REVIEWER_MODEL = "qwen2.5-coder:3b"
+WRITER_MODEL = "llama3.1:8b"
+REVIEWER_MODEL = "qwen2.5-coder:7b"
 CHAT_MODEL = "qwen2.5-coder:3b"
 
 MAX_HEAL_ROUNDS = 5 # max write->output cycles before giving up
