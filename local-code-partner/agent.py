@@ -314,3 +314,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+"""Contextual File Pinning In your CLI loop, catch special command syntax. For example, if a user types: +pin ./src/auth.py
+Your framework intercepts this string, loads the content of auth.py, and pins it statically as a "system context message"
+at the top of the chat stack so the model always acts with explicit awareness of your core codebase structure."""
