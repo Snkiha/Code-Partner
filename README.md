@@ -35,10 +35,7 @@ Before getting started, ensure you have the following environmental engines inst
    npx -v
 
 ## Install Python Dependencies
-```bash pip install ollama mcp rich pydantic```
+```bash 
+pip install ollama mcp rich pydantic
+```
 
-
-3. Contextual File Pinning
-In your CLI loop, catch special command syntax. For example, if a user types:
-+pin ./src/auth.py
-Your framework intercepts this string, loads the content of auth.py, and pins it statically as a "system context message" at the top of the chat stack so the model always acts with explicit awareness of your core codebase structure.
