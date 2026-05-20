@@ -34,6 +34,9 @@ Before getting started, ensure you have the following environmental engines inst
    node -v
    npx -v
 
+## Install Python Dependencies
+```bash pip install ollama mcp rich pydantic
+
 # Standout Features to add
 1. Sequential Multi-Agent "Reviewer" Mode
 Don't just have one model write the code. When a user asks for a feature, use your framework to instantiate two internal roles:
