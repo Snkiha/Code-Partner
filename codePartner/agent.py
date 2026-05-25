@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from pathlib import Path
 
 console = Console()
 ollama_client = Client()
@@ -222,6 +223,24 @@ async def run_mode(sessions, ollama_tools, user_request: str) -> None:
     console.print(f"\n[dim]Running [bold]{run_cmd}[/bold]…[/dim]")
     await run_execute_heal(sessions, ollama_tools, filename, run_cmd)
 
+# -- PIN STORE -- #
+
+pins: list[dict] = []
+
+def _pin_add(raw_path: str) -> str:
+    path = Path(raw_path).resolve()
+    if not path.is_file():
+        return f"[red]Not a file: {raw_path}[/red]"
+    # if already pinned
+    if any(p["path"] == str(path) for p in pins):
+        return f"[yellow]Already pinned: {path.name}[/yellow]"
+    try:
+        content = path.read_text(errors="replace")
+    except Exception as exc:
+        return f"[red]Could not read {raw_path}: {exc}[/red]"
+    pins.append({"path": str(path), "content": content, "name": path.name})
+    return f"[green]Pinned: {path.name} ({len(content):,} chars)[/green]"
+
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
 def _extract_filename(writer_text: str) -> str | None:
@@ -315,6 +334,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-"""Contextual File Pinning In your CLI loop, catch special command syntax. For example, if a user types: +pin ./src/auth.py
-Your framework intercepts this string, loads the content of auth.py, and pins it statically as a "system context message"
-at the top of the chat stack so the model always acts with explicit awareness of your core codebase structure."""
