@@ -241,6 +241,14 @@ def _pin_add(raw_path: str) -> str:
     pins.append({"path": str(path), "content": content, "name": path.name})
     return f"[green]Pinned: {path.name} ({len(content):,} chars)[/green]"
 
+def _pin_remove(raw_path: str) -> str:
+    path = str(Path(raw_path).resolve())
+    before = len(pins)
+    pins[:] = [p for p in pins if p["path"] != path]
+    if len(pins) == before:
+        return f"[yellow]Not pinned: {raw_path}[/yellow]"
+    return f"[green]Unpinned: {Path(raw_path).name}[/green]"
+    
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
 def _extract_filename(writer_text: str) -> str | None:
