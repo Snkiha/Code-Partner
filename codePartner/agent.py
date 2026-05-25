@@ -343,17 +343,18 @@ async def main():
                     break
                 
                 # Pin commands
-                if raw.startswith("+pin"):
-                    console.print(_pin_add(raw.removeprefix("+pin").strip()))
-                    continue
-                
-                if raw.startswith("+unpin"):
-                    console.print(_pin_remove(raw.removeprefix("+unpin").strip()))
-                    continue
-                
                 if raw == "+pins":
                     console.print(_pin_list())
                     continue
+                
+                if raw.startswith("+pin "):
+                    console.print(_pin_add(raw.removeprefix("+pin ").strip()))
+                    continue
+                
+                if raw.startswith("+unpin "):
+                    console.print(_pin_remove(raw.removeprefix("+unpin ").strip()))
+                    continue
+                
                 
                 # Review Mode
                 if raw.lstrip().startswith("--review"):
@@ -374,7 +375,7 @@ async def main():
                 else:
                     # Normal conversational/agentic mode
                     messages.append({"role": "user", "content": raw})
-                    output = await _run_tool_loop(all_sessions, all_tools, messages, CHAT_MODEL, "Chat")
+                    output = await _run_tool_loop(all_sessions, all_tools, _build_messages(messages), CHAT_MODEL, "Chat")
                     
                     console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
                     console.print(Markdown(output or "No response."))
