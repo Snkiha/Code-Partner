@@ -328,6 +328,9 @@ async def main():
                     "[bold green]Local Coding Partner — Bash Sandbox Edition[/bold green]\n\n"
                     "[bold]--review[/bold]〈request〉→ Writer → Reviewer pipeline\n"
                     "[bold]--run[/bold]〈request〉→ Write → Execute → Self-Heal loop\n"
+                    "[bold]+pin[/bold]〈path〉→ Pin file as permanent context\n"
+                    "[bold]+unpin[/bold]〈path〉→ Remove a pinned file\n"
+                    "[bold]+pins[/bold] → List pinned files\n"
                     "Normal input → conversational agent\n\n"
                     "Type [bold]exit[/bold] to quit.",
                     title="System"
