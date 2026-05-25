@@ -12,11 +12,12 @@ from pathlib import Path
 console = Console()
 ollama_client = Client()
 
-WRITER_MODEL = "llama3.1:8b"
-REVIEWER_MODEL = "qwen2.5-coder:7b"
+WRITER_MODEL = "mistral:7b"
+REVIEWER_MODEL = "mistral:7b"
 CHAT_MODEL = "qwen2.5-coder:3b"
+HEALER_MODEL = "mistral:7b"
 
-MAX_HEAL_ROUNDS = 5 # max write->output cycles before giving up
+MAX_HEAL_ROUNDS = 7 # max write->output cycles before giving up
 
 # Define the MCP Server parameters
 server_params = StdioServerParameters(
@@ -112,10 +113,10 @@ async def run_writer(sessions, ollama_tools, user_request: str) -> str:
             "role": "system",
             "content": (
                 "You are an expert software engineer. "
-                "When asked to implement a feature, write clean, production-ready Python code. "
-                "Always save your output to a file in the current directory using the write_file tool. "
-                "Choose a descriptive snake_case filename ending in .py. "
-                "After saving, state the exact filename you used."
+                "Write complete, working Python code for the requested task. "
+                "You MUST call the write_file tool to save it — do not describe the call, do not show JSON, actually invoke the tool. "
+                "Use a snake_case filename ending in .py. "
+                "After the tool call completes, respond with only: 'Saved as <filename>.py'"
             )
         },
         {"role": "user", "content": user_request}
@@ -195,7 +196,7 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
     
     for attempt in range(1, MAX_HEAL_ROUNDS + 1):
         console.print(f"\n[dim]── Attempt {attempt}/{MAX_HEAL_ROUNDS} ──[/dim]")
-        output = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, f"Heal-{attempt}", max_rounds=4)
+        output = await _run_tool_loop(sessions, ollama_tools, messages, HEALER_MODEL, f"Heal-{attempt}", max_rounds=4)
         
         console.print(Markdown(output or ""))
             
