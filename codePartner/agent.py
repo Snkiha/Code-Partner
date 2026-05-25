@@ -248,7 +248,31 @@ def _pin_remove(raw_path: str) -> str:
     if len(pins) == before:
         return f"[yellow]Not pinned: {raw_path}[/yellow]"
     return f"[green]Unpinned: {Path(raw_path).name}[/green]"
-    
+
+def _pin_list() -> str:
+    if not pins:
+        return "[dim]No files pinned.[/dim]"
+    lines = ["[bold]Pinned files:[/bold]"]
+    for p in pins:
+        lines.append(f"- {p['name']}  [dim]({len(p['content']):,} chars)  {p['path']}[/dim]")
+    return "\n".join(lines)
+
+def _build_messages(base_messages: list) -> list:
+    """Prepend a pinned-files system message if anything is pinned"""
+    if not pins:
+        return base_messages
+    sections = "\n\n".join(f"## {p['name']} ({p['path']})\n```python\n{p['content']}\n```" for p in pins)
+    pin_msg = {
+        "role": "system",
+        "content": (
+            "The following files have been pinned by the user as permanent context. "
+            "Always take them into account when answering.\n\n"
+            f"PINNED FILES:\n{sections}"
+        )
+    }
+    # Insert after the first system message (the role prompt)
+    return [base_messages[0], pin_msg] + base_messages[1:]
+
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
 def _extract_filename(writer_text: str) -> str | None:
