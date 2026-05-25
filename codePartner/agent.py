@@ -339,6 +339,19 @@ async def main():
                 if raw.lower().strip() in ("exit", "quit"):
                     break
                 
+                # Pin commands
+                if raw.startswith("+pin"):
+                    console.print(_pin_add(raw.removeprefix("+pin").strip()))
+                    continue
+                
+                if raw.startswith("+unpin"):
+                    console.print(_pin_remove(raw.removeprefix("+unpin").strip()))
+                    continue
+                
+                if raw == "+pins":
+                    console.print(_pin_list())
+                    continue
+                
                 # Review Mode
                 if raw.lstrip().startswith("--review"):
                     user_request = raw.lstrip().removeprefix("--review").strip()
