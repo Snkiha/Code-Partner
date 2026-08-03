@@ -17,7 +17,7 @@ REVIEWER_MODEL = "mistral:7b"
 CHAT_MODEL = "qwen2.5-coder:3b"
 HEALER_MODEL = "mistral:7b"
 
-MAX_HEAL_ROUNDS = 7 # max write->output cycles before giving up
+MAX_HEAL_ROUNDS = 5 # max write->output cycles before giving up
 
 # Define the MCP Server parameters
 server_params = StdioServerParameters(
@@ -175,13 +175,11 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
             "role": "system",
             "content": (
                 "You are an autonomous debugging engineer. "
-                "Use run_command to execute the script. "
-                "If it fails (non-zero exit code), read the error output carefully, "
-                "use read_file to inspect the code, then use write_file to patch exactly "
-                "the broken lines. Do NOT rewrite the entire file unless necessary. "
-                "After patching, run the command again. "
-                f"Repeat until exit code is 0 or you have tried {MAX_HEAL_ROUNDS} times. "
-                "Give a concise summary of what was fixed when done."
+                "First, use your bash/execution tool to run the script. "
+                "If it fails with an error, read the error output carefully, "
+                "use the file reading tool to inspect the code, and the file writing tool to patch it. "
+                "Keep running and patching until it works. "
+                "CRITICAL: When the script executes perfectly with NO errors, you MUST reply with the exact phrase: 'STATUS: SUCCESS'."
             )
         },
         {
@@ -189,7 +187,7 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
             "content": (
                 f"Script: {filename}\n"
                 f"Run command: {run_cmd}\n\n"
-                "Start by running the command and report the result."
+                "Start by running the command and evaluating the output."
             )
         }
     ]
