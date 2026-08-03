@@ -39,3 +39,19 @@ Before getting started, ensure you have the following environmental engines inst
 pip install ollama mcp rich pydantic
 ```
 
+## Running the Agent
+```bash 
+python agent.py
+```
+
+## Docker Deployment
+```bash 
+docker build -t local-coder .
+```
+### Running the Sandbox
+```bash 
+docker run -it \
+  --add-host=host.docker.internal:host-gateway \
+  -v "$(pwd)/my_project:/workspace" \
+  local-coder
+```
