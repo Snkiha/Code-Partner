@@ -309,86 +309,94 @@ async def review_mode(sessions, ollama_tools, user_request: str) -> None:
     
     
 async def main():
-    async with stdio_client(server_params) as (read_stream, write_stream), \
-            stdio_client(bash_server_params) as (bash_read, bash_write):
+    try:
+        async with stdio_client(server_params) as (read_stream, write_stream), \
+                stdio_client(bash_server_params) as (bash_read, bash_write):
 
-        async with ClientSession(read_stream, write_stream) as fs_session, \
-                ClientSession(bash_read, bash_write) as bash_session:
+            async with ClientSession(read_stream, write_stream) as fs_session, \
+                    ClientSession(bash_read, bash_write) as bash_session:
 
-            await fs_session.initialize()
-            await bash_session.initialize()
+                await fs_session.initialize()
+                await bash_session.initialize()
 
-            all_sessions = {"fs": fs_session, "bash": bash_session}
+                all_sessions = {"fs": fs_session, "bash": bash_session}
 
-            fs_tools   = _tool_schema(await fs_session.list_tools())
-            bash_tools = _tool_schema(await bash_session.list_tools())
-            all_tools  = _merge_tools(fs_tools, bash_tools)
-        
-            # System prompt optimized for a terminal developer environment
-            messages = [{
-                "role": "system",
-                "content": (
-                    "You are an elite terminal-based pair programmer with access to "
-                    "filesystem tools (read/write files) and a bash execution tool "
-                    "(run shell commands). Use them freely. Be concise and direct."
-                    )
-            }]
+                fs_tools   = _tool_schema(await fs_session.list_tools())
+                bash_tools = _tool_schema(await bash_session.list_tools())
+                all_tools  = _merge_tools(fs_tools, bash_tools)
             
-            console.print(Panel(
-                    "[bold green]Local Coding Partner — Bash Sandbox Edition[/bold green]\n\n"
-                    "[bold]--review[/bold]〈request〉→ Writer → Reviewer pipeline\n"
-                    "[bold]--run[/bold]〈request〉→ Write → Execute → Self-Heal loop\n"
-                    "[bold]+pin[/bold]〈path〉→ Pin file as permanent context\n"
-                    "[bold]+unpin[/bold]〈path〉→ Remove a pinned file\n"
-                    "[bold]+pins[/bold] → List pinned files\n"
-                    "Normal input → conversational agent\n\n"
-                    "Type [bold]exit[/bold] to quit.",
-                    title="System"
-            ))
-            
-            # Interactive Terminal Loop
-            while True:
-                raw = console.input("\n[bold blue]You:[/bold blue]")
-                if raw.lower().strip() in ("exit", "quit"):
-                    break
+                # System prompt optimized for a terminal developer environment
+                messages = [{
+                    "role": "system",
+                    "content": (
+                        "You are an elite terminal-based pair programmer with access to "
+                        "filesystem tools (read/write files) and a bash execution tool "
+                        "(run shell commands). Use them freely. Be concise and direct."
+                        )
+                }]
                 
-                # Pin commands
-                if raw == "+pins":
-                    console.print(_pin_list())
-                    continue
+                console.print(Panel(
+                        "[bold green]Local Coding Partner — Bash Sandbox Edition[/bold green]\n\n"
+                        "[bold]--review[/bold]〈request〉→ Writer → Reviewer pipeline\n"
+                        "[bold]--run[/bold]〈request〉→ Write → Execute → Self-Heal loop\n"
+                        "[bold]+pin[/bold]〈path〉→ Pin file as permanent context\n"
+                        "[bold]+unpin[/bold]〈path〉→ Remove a pinned file\n"
+                        "[bold]+pins[/bold] → List pinned files\n"
+                        "Normal input → conversational agent\n\n"
+                        "Type [bold]exit[/bold] to quit.",
+                        title="System"
+                ))
                 
-                if raw.startswith("+pin "):
-                    console.print(_pin_add(raw.removeprefix("+pin ").strip()))
-                    continue
-                
-                if raw.startswith("+unpin "):
-                    console.print(_pin_remove(raw.removeprefix("+unpin ").strip()))
-                    continue
-                
-                
-                # Review Mode
-                if raw.lstrip().startswith("--review"):
-                    user_request = raw.lstrip().removeprefix("--review").strip()
-                    if not user_request:
-                        console.print("[yellow]Please describe what you want to build.[/yellow]")
-                        continue
-                    await review_mode(all_sessions, all_tools, user_request)
-                    continue
-                
-                elif raw.startswith("--run"):
-                    request = raw.removeprefix("--run").strip()
-                    if not request:
-                        console.print("[yellow]Usage: --run <what to build>[/yellow]")
-                        continue
-                    await run_mode(all_sessions, all_tools, request)
-                
-                else:
-                    # Normal conversational/agentic mode
-                    messages.append({"role": "user", "content": raw})
-                    output = await _run_tool_loop(all_sessions, all_tools, _build_messages(messages), CHAT_MODEL, "Chat")
+                # Interactive Terminal Loop
+                while True:
+                    raw = console.input("\n[bold blue]You:[/bold blue]")
+                    if raw.lower().strip() in ("exit", "quit"):
+                        break
                     
-                    console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                    console.print(Markdown(output or "No response."))
+                    # Pin commands
+                    if raw == "+pins":
+                        console.print(_pin_list())
+                        continue
+                    
+                    if raw.startswith("+pin "):
+                        console.print(_pin_add(raw.removeprefix("+pin ").strip()))
+                        continue
+                    
+                    if raw.startswith("+unpin "):
+                        console.print(_pin_remove(raw.removeprefix("+unpin ").strip()))
+                        continue
+                    
+                    
+                    # Review Mode
+                    if raw.lstrip().startswith("--review"):
+                        user_request = raw.lstrip().removeprefix("--review").strip()
+                        if not user_request:
+                            console.print("[yellow]Please describe what you want to build.[/yellow]")
+                            continue
+                        await review_mode(all_sessions, all_tools, user_request)
+                        continue
+                    
+                    elif raw.startswith("--run"):
+                        request = raw.removeprefix("--run").strip()
+                        if not request:
+                            console.print("[yellow]Usage: --run <what to build>[/yellow]")
+                            continue
+                        await run_mode(all_sessions, all_tools, request)
+                    
+                    else:
+                        # Normal conversational/agentic mode
+                        messages.append({"role": "user", "content": raw})
+                        output = await _run_tool_loop(all_sessions, all_tools, _build_messages(messages), CHAT_MODEL, "Chat")
+                        
+                        console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
+                        console.print(Markdown(output or "No response."))
+    except Exception as exc:
+        console.print(Panel(
+            f"[bold red]Failed to start MCP servers or Ollama connection:[/bold red]\n{exc}\n\n"
+            "Check that 'npx', 'bash_mcp_server.py', and the Ollama daemon are all reachable.",
+            title="Startup Error"
+        ))
+        return
 
 if __name__ == "__main__":
     asyncio.run(main())
