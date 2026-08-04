@@ -1,6 +1,6 @@
 import asyncio
 import os
-from ollama import Client
+from ollama import AsyncClient
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from rich.console import Console
@@ -8,9 +8,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from pathlib import Path
+import shutil
 
 console = Console()
-ollama_client = Client()
+ollama_client = AsyncClient()
 
 WRITER_MODEL = "mistral:7b"
 REVIEWER_MODEL = "mistral:7b"
@@ -24,6 +25,8 @@ server_params = StdioServerParameters(
     command="npx",
     args=["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()]
 )
+
+PYTHON_BIN = shutil.which("python3") or shutil.which("python") or "python3"
 
 bash_server_params = StdioServerParameters(
     command="python",
@@ -56,13 +59,22 @@ def _merge_tools(*schemas: list) -> list:
     return merged
 
 async def _call_tool(sessions: dict, name: str, args: dict) -> str:
+    last_error = None
     for session in sessions.values():
         try:
             result = await session.call_tool(name, arguments=args)
-            return "".join(getattr(item, "text", str(item)) for item in result.content)
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
-    return f"Error: no session could handle tool '{name}'"
+        
+        text = "".join(getattr(item, "text". str(item)) for item in result.content)
+        if getattr(result, "isError", False):
+            last_error = text
+            continue
+        
+        return text
+    
+    return f"Error: no session could handle tool '{name}' ({last_error})"
 
 async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> str:
     """
@@ -70,7 +82,7 @@ async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, mod
     Returns the agent's final text response.
     """
     for _ in range(max_rounds):
-        response = ollama_client.chat(
+        response = await ollama_client.chat(
             model=model,
             messages=messages,
             tools=ollama_tools,
@@ -97,7 +109,8 @@ async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, mod
             messages.append({"role": "tool", "content": result_text, "name": name})
     
     # Max rounds hit - ask for final summary with no tools
-    final = ollama_client.chat(model=model, messages=messages, options={"num_ctx": 16384})
+    final = await ollama_client.chat(model=model, messages=messages, options={"num_ctx": 16384})
+    messages.append(final.message)
     return final.message.content or ""
 
 # -- WRITER AGENT -- #
@@ -195,17 +208,15 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
     for attempt in range(1, MAX_HEAL_ROUNDS + 1):
         console.print(f"\n[dim]── Attempt {attempt}/{MAX_HEAL_ROUNDS} ──[/dim]")
         output = await _run_tool_loop(sessions, ollama_tools, messages, HEALER_MODEL, f"Heal-{attempt}", max_rounds=4)
-        
         console.print(Markdown(output or ""))
-            
-        last_tool_results = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
-        if last_tool_results and "Exit code: 0" in last_tool_results[-1]["content"]:
+        
+        if "STATUS: SUCCESS" in (output or "").upper():
             console.print(Panel(f"[bold green]✓ Script ran successfully after {attempt} attempt(s).[/bold green]", title="Self-Heal"))
             return
         
         messages.append({
             "role": "user",
-            "content": "Still failing. Patch the code and run it again."
+            "content": "If the script is still failing, patch it and run it again. If it ran perfectly, output 'STATUS: SUCCESS'."
         })
     
     console.print(Panel(f"[bold red]✗ Still failing after {MAX_HEAL_ROUNDS} attempts.[/bold red]\n"

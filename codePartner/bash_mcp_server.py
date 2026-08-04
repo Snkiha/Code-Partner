@@ -37,7 +37,6 @@ ALLOW_ALL = os.getenv("BASH_MCP_ALLOW_ALL", "0") == "1"
 # Executables the LLM is allowed to invoke
 ALLOWED_COMMANDS: set[str] = {
     "python",
-    "python3",
     "node",
     "npm",
     "npx",
@@ -84,7 +83,7 @@ async def list_tools() -> list[Tool]:
                     "command": {
                         "type": "string",
                         "description": (
-                            "The full command to run, e.g. 'python3 feature.py' "
+                            "The full command to run, e.g. 'python feature.py' "
                             "or 'pytest tests/ -v'. Do NOT use shell operators "
                             "like &&, |, ;, >, or $()."
                         ),
