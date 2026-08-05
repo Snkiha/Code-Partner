@@ -66,6 +66,16 @@ def _merge_tools(*schemas: list) -> list:
                 merged.append(tool)
     return merged
 
+def _filter_tools(schema: list, names: set[str]) -> list:
+    """
+    Narrow a merged tool schema down to just the tools a specific sub-agent
+    needs. Small local models (7B and under) get noticeably less reliable at
+    emitting a real tool call as the number of tool schemas offered grows —
+    handing every agent the full 15-tool fs+bash set caused the Writer to
+    consistently narrate a fake tool call instead of invoking write_file.
+    """
+    return [tool for tool in schema if tool["function"]["name"] in names]
+
 async def _call_tool(sessions: dict, name: str, args: dict) -> tuple[str, bool]:
     """
     Call `name` on whichever session supports it.
@@ -134,6 +144,15 @@ async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, mod
     messages.append(final.message)
     return final.message.content or "", tool_calls_made
 
+WRITER_SYSTEM_PROMPT = (
+    "You are a code-writing tool. For every request, respond ONLY by calling the write_file tool — "
+    "never write code, explanations, or commentary in your message text. "
+    "Put the complete, working Python source in the 'content' argument and a snake_case '<name>.py' "
+    "filename in the 'path' argument. Do not narrate the call."
+)
+
+WRITER_MAX_ATTEMPTS = 3  # small local models sometimes narrate a fake call instead of invoking write_file; retry before giving up
+
 # -- WRITER AGENT -- #
 async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, str | None]:
     """
@@ -144,30 +163,29 @@ async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, st
     """
     console.print(Rule("[bold cyan]Writer agent[/bold cyan]"))
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert software engineer. "
-                "Write complete, working Python code for the requested task. "
-                "You MUST call the write_file tool to save it — do not describe the call, do not show JSON, actually invoke the tool. "
-                "Use a snake_case filename ending in .py. "
-                "After the tool call completes, respond with only: 'Done.'"
-            )
-        },
-        {"role": "user", "content": user_request}
-    ]
-    response_text, tool_calls = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, "Writer")
+    response_text = ""
+    for attempt in range(1, WRITER_MAX_ATTEMPTS + 1):
+        messages = [
+            {"role": "system", "content": WRITER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_request}
+        ]
+        response_text, tool_calls = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, "Writer")
+
+        saved_filename = None
+        for name, args in tool_calls:
+            if name == "write_file" and isinstance(args, dict) and args.get("path"):
+                saved_filename = args["path"]
+
+        if saved_filename:
+            console.print("\n[bold cyan]Writer:[/bold cyan]")
+            console.print(Markdown(response_text or "No commentary."))
+            return response_text, saved_filename
+
+        console.print(f"[dim]Writer attempt {attempt}/{WRITER_MAX_ATTEMPTS} produced no write_file call — retrying…[/dim]")
 
     console.print("\n[bold cyan]Writer:[/bold cyan]")
     console.print(Markdown(response_text or "No commentary."))
-
-    saved_filename = None
-    for name, args in tool_calls:
-        if name == "write_file" and isinstance(args, dict) and args.get("path"):
-            saved_filename = args["path"]
-
-    return response_text, saved_filename
+    return response_text, None
 
 # -- REVIEWER AGENT -- #
 async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
@@ -303,7 +321,10 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
     ))
 
 async def run_mode(sessions, ollama_tools, user_request: str) -> None:
-    _, filename = await run_writer(sessions, ollama_tools, user_request)
+    writer_tools = _filter_tools(ollama_tools, {"write_file"})
+    healer_tools = _filter_tools(ollama_tools, {"read_file", "write_file"})
+
+    _, filename = await run_writer(sessions, writer_tools, user_request)
     if not filename:
         console.print(Panel(
             "[bold red]✗ The Writer did not call write_file — no file was saved.[/bold red]\n"
@@ -315,7 +336,7 @@ async def run_mode(sessions, ollama_tools, user_request: str) -> None:
 
     run_cmd = f"python {filename}"
     console.print(f"\n[dim]Running [bold]{run_cmd}[/bold]…[/dim]")
-    await run_execute_heal(sessions, ollama_tools, filename, run_cmd)
+    await run_execute_heal(sessions, healer_tools, filename, run_cmd)
 
 # -- PIN STORE -- #
 
@@ -370,7 +391,10 @@ def _build_messages(base_messages: list) -> list:
 # -- REVIEW-MODE ORCHESTRATOR -- #
 
 async def review_mode(sessions, ollama_tools, user_request: str) -> None:
-    _, filename = await run_writer(sessions, ollama_tools, user_request)
+    writer_tools = _filter_tools(ollama_tools, {"write_file"})
+    reviewer_tools = _filter_tools(ollama_tools, {"read_file", "write_file"})
+
+    _, filename = await run_writer(sessions, writer_tools, user_request)
 
     if not filename:
         console.print(Panel(
@@ -381,7 +405,7 @@ async def review_mode(sessions, ollama_tools, user_request: str) -> None:
         return
 
     console.print(f"\n[dim]Writer saved: [bold]{filename}[/bold]. Handing off to Reviewer…[/dim]")
-    await run_reviewer(sessions, ollama_tools, filename)
+    await run_reviewer(sessions, reviewer_tools, filename)
 
 
 async def main():
