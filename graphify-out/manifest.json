@@ -1,0 +1,22 @@
+{
+  "codePartner/agent.py": {
+    "mtime": 1785926792.8096497,
+    "ast_hash": "a11b0fac5e0983d1a19c3a7dd3623a3f",
+    "semantic_hash": "a11b0fac5e0983d1a19c3a7dd3623a3f"
+  },
+  "codePartner/bash_mcp_server.py": {
+    "mtime": 1785828265.5605886,
+    "ast_hash": "c175912647540b72f806a6cb68f39cfc",
+    "semantic_hash": "c175912647540b72f806a6cb68f39cfc"
+  },
+  "README.md": {
+    "mtime": 1785774704.6095004,
+    "ast_hash": "79109200bbf89a0f4faedb1e49b01504",
+    "semantic_hash": "79109200bbf89a0f4faedb1e49b01504"
+  },
+  "codePartner/requirements.txt": {
+    "mtime": 1779722578.3288593,
+    "ast_hash": "c7ba704c3129cfd8baa8a9a69c735ed2",
+    "semantic_hash": "c7ba704c3129cfd8baa8a9a69c735ed2"
+  }
+}
