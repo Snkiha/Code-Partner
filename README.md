@@ -35,8 +35,11 @@ Before getting started, ensure you have the following environmental engines inst
    npx -v
 
 ## Install Python Dependencies
-```bash 
-pip install ollama mcp rich pydantic
+
+Requires **Python 3.11+** (uses `ExceptionGroup` handling).
+
+```bash
+pip install -r codePartner/requirements.txt
 ```
 
 ## Running the Agent
@@ -49,9 +52,24 @@ python agent.py
 docker build -t local-coder .
 ```
 ### Running the Sandbox
-```bash 
+
+The `run_command` tool executes model-generated code, so run the container with
+the tightest limits your workflow allows:
+
+```bash
 docker run -it \
   --add-host=host.docker.internal:host-gateway \
   -v "$(pwd)/my_project:/workspace" \
+  --pids-limit=256 \
+  --memory=2g \
+  --cpus=2 \
+  --read-only --tmpfs /tmp \
   local-coder
 ```
+
+Notes:
+- `--pids-limit` contains fork bombs; `--memory` / `--cpus` cap runaway processes.
+- Omit `--network none` only because the filesystem MCP server is fetched via
+  `npx` at startup. If you bake it into the image, add `--network none` to cut
+  off package downloads and exfiltration entirely.
+- The container already runs as a non-root `agent` user.
