@@ -1,6 +1,16 @@
 import asyncio
 import os
 import sys
+
+# The UI (rich panels, rules) uses box-drawing chars and emoji. On Windows those
+# crash with UnicodeEncodeError the moment stdout is not UTF-8 — a plain cmd.exe
+# (cp1252), or any redirected / piped output. Force UTF-8 before anything prints.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from ollama import AsyncClient
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -104,12 +114,20 @@ async def _call_tool(sessions: dict, name: str, args: dict) -> tuple[str, bool]:
 
     return f"no session could handle tool '{name}' ({last_error})", True
 
-async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, model: str, label: str, *, max_rounds: int = 6) -> tuple[str, list]:
+async def _run_tool_loop(
+    sessions: dict, ollama_tools: list, messages: list, model: str, label: str,
+    *, max_rounds: int = 6, require_tool: set[str] | None = None,
+) -> tuple[str, list]:
     """
     Drive a single agent through up to 'max_rounds' of tool-call cycles.
     Returns (final_text, tool_calls_made) where tool_calls_made is a list of
     (name, args) tuples in the order they were called — callers can inspect
     this instead of parsing the model's natural-language summary.
+
+    require_tool: if given, a text-only response does NOT end the loop until at
+    least one of those tools has actually been called. Small local models love
+    to answer "the fix is X" in prose without ever emitting the tool call; this
+    nudges them back on task instead of returning an empty-handed result.
     """
     tool_calls_made: list = []
 
@@ -124,7 +142,21 @@ async def _run_tool_loop(sessions: dict, ollama_tools: list, messages: list, mod
         if not response.message.tool_calls:
             content = response.message.content or ""
             messages.append(response.message)
-            return content, tool_calls_made
+
+            required_done = not require_tool or any(n in require_tool for n, _ in tool_calls_made)
+            if required_done:
+                return content, tool_calls_made
+
+            console.print(f"[dim]  [{label}] answered in prose without a tool call — nudging…[/dim]")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You replied with text but made no tool call. You MUST call one of "
+                    f"[{', '.join(sorted(require_tool))}] now to actually apply the change. "
+                    "Do not explain — just make the call."
+                ),
+            })
+            continue
 
         # Agent wants to call one or more tools
         messages.append(response.message)
@@ -299,6 +331,7 @@ async def _heal_once(
         _, tool_calls = await _run_tool_loop(
             sessions, healer_tools, messages, HEALER_MODEL,
             f"Heal-{attempt}.{retry}", max_rounds=5,
+            require_tool={"write_file", "edit_file"},
         )
 
         wrote_target = any(
