@@ -1,4 +1,6 @@
+import ast
 import asyncio
+import json
 import os
 import sys
 
@@ -23,10 +25,15 @@ from pathlib import Path
 console = Console()
 ollama_client = AsyncClient()
 
-WRITER_MODEL = "mistral:7b"
-REVIEWER_MODEL = "mistral:7b"
-CHAT_MODEL = "qwen2.5-coder:3b"
-HEALER_MODEL = "mistral:7b"
+# mistral:7b is the most reliable *structured* tool-caller of the small local
+# models tried here (qwen2.5-coder:7b tends to echo the tool schema back as a
+# string). Its weak spots — narrating a fix as prose, or emitting the call as
+# JSON text, or mangling indentation — are handled downstream by the text
+# tool-call recovery, the require_tool nudge, and the Writer syntax gate.
+WRITER_MODEL = "qwen2.5-coder:7b"
+REVIEWER_MODEL = "qwen3.5:0.8b"
+CHAT_MODEL = "qwen3.5:0.8b"
+HEALER_MODEL = "qwen2.5-coder:7b"
 
 MAX_HEAL_ROUNDS = 5  # max write->output cycles before giving up
 HEAL_WRITE_RETRIES = 2  # within one round, re-prompt if the Healer narrates instead of calling a write tool
@@ -114,6 +121,70 @@ async def _call_tool(sessions: dict, name: str, args: dict) -> tuple[str, bool]:
 
     return f"no session could handle tool '{name}' ({last_error})", True
 
+def _unwrap_arg(value):
+    """
+    Some local models wrap a scalar arg as {"type": "string", "content": "..."}
+    or {"value": ...}. Unwrap so write_file gets a plain string for 'content'.
+    """
+    if isinstance(value, dict):
+        for key in ("content", "value", "text"):
+            inner = value.get(key)
+            if isinstance(inner, (str, int, float, bool)):
+                return inner
+    return value
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Return the first brace-balanced JSON object in `text` that parses, else None."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = text[start:i + 1]
+                    for kw in ({}, {"strict": False}):  # strict=False tolerates literal newlines in strings
+                        try:
+                            obj = json.loads(chunk, **kw)
+                            if isinstance(obj, dict):
+                                return obj
+                        except json.JSONDecodeError:
+                            continue
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _recover_text_tool_call(content: str) -> tuple[str, dict] | None:
+    """
+    Small local models via Ollama frequently emit a tool call as JSON *text* in
+    the message body instead of in the structured tool_calls field — e.g.
+        {"name": "write_file", "arguments": {"path": "x.py", "content": "..."}}
+    (bare or inside a ```json fence). Recover it so the agent still acts.
+    """
+    if not content or '"name"' not in content:
+        return None
+    obj = _first_json_object(content)
+    if not obj:
+        return None
+    name = obj.get("name") or obj.get("tool")
+    if not isinstance(name, str):
+        return None
+    raw_args = obj.get("arguments", obj.get("parameters", {}))
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            raw_args = {}
+    if not isinstance(raw_args, dict):
+        return None
+    return name, {k: _unwrap_arg(v) for k, v in raw_args.items()}
+
+
 async def _run_tool_loop(
     sessions: dict, ollama_tools: list, messages: list, model: str, label: str,
     *, max_rounds: int = 6, require_tool: set[str] | None = None,
@@ -139,7 +210,18 @@ async def _run_tool_loop(
             options={"num_ctx": 16384, "temperature": 0.1}  # Forces a larger memory buffer
         )
 
-        if not response.message.tool_calls:
+        # Normalise structured tool_calls and text-embedded ones into one list.
+        calls: list[tuple[str, dict]] = []
+        for tc in response.message.tool_calls or []:
+            calls.append((tc.function.name, tc.function.arguments))
+        recovered = False
+        if not calls:
+            salvaged = _recover_text_tool_call(response.message.content or "")
+            if salvaged:
+                calls = [salvaged]
+                recovered = True
+
+        if not calls:
             content = response.message.content or ""
             messages.append(response.message)
 
@@ -158,11 +240,14 @@ async def _run_tool_loop(
             })
             continue
 
+        if recovered:
+            console.print(f"[dim]  [{label}] recovered a text-embedded tool call: {calls[0][0]}[/dim]")
+
         # Agent wants to call one or more tools
         messages.append(response.message)
-        for tc in response.message.tool_calls:
-            name = tc.function.name
-            args = tc.function.arguments
+        for name, args in calls:
+            if not isinstance(args, dict):
+                args = {}
             tool_calls_made.append((name, args))
             console.print(f"[yellow]⚡ [{label}] calling '{name}' → {args}[/yellow]")
             try:
@@ -184,10 +269,43 @@ WRITER_SYSTEM_PROMPT = (
     "You are a code-writing tool. For every request, respond ONLY by calling the write_file tool — "
     "never write code, explanations, or commentary in your message text. "
     "Put the complete, working Python source in the 'content' argument and a snake_case '<name>.py' "
-    "filename in the 'path' argument. Do not narrate the call."
+    "filename in the 'path' argument. Do not narrate the call.\n"
+    "Indentation rules (strict): use exactly 4 spaces per indentation level, never tab characters, "
+    "and keep it consistent. The file you write must parse and run as-is."
 )
 
-WRITER_MAX_ATTEMPTS = 3  # small local models sometimes narrate a fake call instead of invoking write_file; retry before giving up
+WRITER_MAX_ATTEMPTS = 3  # retry when the model emits no write_file call, or writes code that doesn't parse
+
+
+_MEANINGFUL_NODES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+    ast.Import, ast.ImportFrom,
+    ast.Assign, ast.AnnAssign, ast.AugAssign,
+    ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try,
+)
+
+
+def _python_content_problem(source: str) -> str | None:
+    """
+    Return a one-line reason the source is unusable as a script, else None.
+    Catches both parse failures (mangled indentation, tabs) and "parses fine but
+    isn't real code" — e.g. a model that echoed the tool schema as a bare dict
+    literal, which ast.parse happily accepts and `python file.py` runs to a
+    no-op exit 0.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:  # covers IndentationError / TabError
+        where = f" (line {exc.lineno})" if exc.lineno else ""
+        return f"{type(exc).__name__}: {exc.msg}{where}"
+
+    for node in tree.body:
+        if isinstance(node, _MEANINGFUL_NODES):
+            return None
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            return None  # a top-level call like print(...) counts
+    return "file has no runnable statements (no function, call, import, loop or assignment)"
+
 
 # -- WRITER AGENT -- #
 async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, str | None]:
@@ -195,32 +313,71 @@ async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, st
     Writer Agent: Generates code and saves it to disk via MCP.
     Returns (response_text, filename) — filename is taken directly from the
     write_file tool call's arguments (ground truth), never parsed from the
-    model's text response.
+    model's text response. A .py file that does not parse is rejected and the
+    Writer is retried with the syntax error, so execution never receives
+    structurally broken code (e.g. mangled indentation).
     """
     console.print(Rule("[bold cyan]Writer agent[/bold cyan]"))
 
     response_text = ""
+    saved_filename = None
+    syntax_feedback = None
+
     for attempt in range(1, WRITER_MAX_ATTEMPTS + 1):
+        user_content = user_request
+        if syntax_feedback:
+            user_content = (
+                f"{user_request}\n\n"
+                f"Your previous file did NOT parse — {syntax_feedback}\n"
+                "Rewrite the COMPLETE file as valid Python: 4-space indents, no tabs."
+            )
         messages = [
             {"role": "system", "content": WRITER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_request}
+            {"role": "user", "content": user_content},
         ]
-        response_text, tool_calls = await _run_tool_loop(sessions, ollama_tools, messages, WRITER_MODEL, "Writer")
+        response_text, tool_calls = await _run_tool_loop(
+            sessions, ollama_tools, messages, WRITER_MODEL, "Writer",
+            require_tool={"write_file"},
+        )
 
-        saved_filename = None
+        saved_content = None
         for name, args in tool_calls:
             if name == "write_file" and isinstance(args, dict) and args.get("path"):
                 saved_filename = args["path"]
+                saved_content = args.get("content")
 
-        if saved_filename:
+        if not saved_filename:
+            console.print(f"[dim]Writer attempt {attempt}/{WRITER_MAX_ATTEMPTS} produced no write_file call — retrying…[/dim]")
+            continue
+
+        content_ok = True
+        if str(saved_filename).endswith(".py") and isinstance(saved_content, str):
+            syntax_feedback = _python_content_problem(saved_content)
+            if syntax_feedback:
+                content_ok = False
+                console.print(
+                    f"[yellow]Writer attempt {attempt}/{WRITER_MAX_ATTEMPTS}: "
+                    f"{saved_filename} rejected ({syntax_feedback}) — retrying…[/yellow]"
+                )
+                continue
+
+        if content_ok:
             console.print("\n[bold cyan]Writer:[/bold cyan]")
             console.print(Markdown(response_text or "No commentary."))
             return response_text, saved_filename
 
-        console.print(f"[dim]Writer attempt {attempt}/{WRITER_MAX_ATTEMPTS} produced no write_file call — retrying…[/dim]")
-
     console.print("\n[bold cyan]Writer:[/bold cyan]")
     console.print(Markdown(response_text or "No commentary."))
+    # Only hand off a file if the last attempt's content actually passed the gate.
+    # A file that never parsed / had no real code is worse than an honest failure —
+    # `python file.py` on a bare dict literal exits 0 and looks like success.
+    if saved_filename and not syntax_feedback:
+        return response_text, saved_filename
+    if saved_filename:
+        console.print(
+            f"[red]✗ Writer never produced usable code for [bold]{saved_filename}[/bold] "
+            f"({syntax_feedback}).[/red]"
+        )
     return response_text, None
 
 # -- REVIEWER AGENT -- #
