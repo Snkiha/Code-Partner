@@ -20,7 +20,6 @@ Security notes (read before deploying):
 import asyncio
 import os
 import shlex
-import subprocess
 from pathlib import Path
 
 from mcp.server import Server
@@ -176,12 +175,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     stderr = stderr_bytes.decode(errors="replace")
     rc = proc.returncode
     
-    # Truncate runaway output so it does not flood the context window
-    def _truncate(text: str, label:str) -> str:
-        if len(text) > MAX_OUTPUT_CHARS:
-            kept = text[:MAX_OUTPUT_CHARS]
-            return f"{kept}\n\n[{label} truncated — {len(text) - MAX_OUTPUT_CHARS} chars omitted]"
-        return text
+    # Truncate runaway output so it does not flood the context window.
+    # Keep the head AND the tail: Python tracebacks and test-failure summaries
+    # live at the end of the stream, so a head-only cut hides the actual error
+    # the Healer needs to see.
+    def _truncate(text: str, label: str) -> str:
+        if len(text) <= MAX_OUTPUT_CHARS:
+            return text
+        head_chars = MAX_OUTPUT_CHARS // 3
+        tail_chars = MAX_OUTPUT_CHARS - head_chars
+        omitted = len(text) - head_chars - tail_chars
+        return (
+            f"{text[:head_chars]}\n\n"
+            f"[{label} truncated — {omitted} chars omitted from the middle]\n\n"
+            f"{text[-tail_chars:]}"
+        )
     
     stdout = _truncate(stdout, "stdout")
     stderr = _truncate(stderr, "stderr")

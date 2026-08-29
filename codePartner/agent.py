@@ -23,10 +23,13 @@ MAX_HEAL_ROUNDS = 5  # max write->output cycles before giving up
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASH_SERVER_ERRLOG = SCRIPT_DIR / "bash_mcp_server.stderr.log"
 
-# Define the MCP Server parameters
+# Define the MCP Server parameters.
+# Pin the filesystem server version — an unpinned "@latest" via npx means a
+# silent dependency upgrade (and potential tool-name/behaviour drift) on any run.
+FS_SERVER_PKG = "@modelcontextprotocol/server-filesystem@2026.7.10"
 server_params = StdioServerParameters(
     command="npx",
-    args=["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()]
+    args=["-y", FS_SERVER_PKG, os.getcwd()]
 )
 
 # IMPORTANT: use sys.executable, not a re-resolved "python"/"python3" from PATH.
@@ -194,7 +197,9 @@ async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
     """
     console.print(Rule("[bold magenta]Reviewer agent[/bold magenta]"))
 
-    review_file = filename.rsplit(".", 1)[0] + ".review.md"
+    # Path-aware: filename.rsplit(".", 1) breaks on a dot in a parent directory
+    # (e.g. "pkg.v2/main.py" -> "pkg"). with_suffix only touches the final component.
+    review_file = str(Path(filename).with_suffix(".review.md"))
 
     messages = [
         {
@@ -408,8 +413,49 @@ async def review_mode(sessions, ollama_tools, user_request: str) -> None:
     await run_reviewer(sessions, reviewer_tools, filename)
 
 
+async def _preflight() -> bool:
+    """
+    Verify Ollama is reachable and every model this app uses is already pulled.
+    Fail here with an actionable message instead of cryptically deep inside a
+    pipeline on the first ollama_client.chat() call.
+    """
+    required = sorted({WRITER_MODEL, REVIEWER_MODEL, CHAT_MODEL, HEALER_MODEL})
+
+    try:
+        listed = await ollama_client.list()
+    except Exception as exc:
+        console.print(Panel(
+            f"[bold red]Cannot reach Ollama:[/bold red] {type(exc).__name__}: {exc}\n\n"
+            "Start it with [bold]ollama serve[/bold], or install from https://ollama.com/.",
+            title="Preflight failed", border_style="red",
+        ))
+        return False
+
+    available: set[str] = set()
+    for m in getattr(listed, "models", []):
+        name = getattr(m, "model", None) or getattr(m, "name", None)
+        if name:
+            available.add(name)
+            available.add(name.split(":", 1)[0])  # tolerate an implicit ":latest"
+
+    missing = [m for m in required if m not in available and m.split(":", 1)[0] not in available]
+    if missing:
+        pulls = "\n".join(f"  ollama pull {m}" for m in missing)
+        console.print(Panel(
+            f"[bold red]Missing Ollama models:[/bold red] {', '.join(missing)}\n\n"
+            f"Pull them first:\n{pulls}",
+            title="Preflight failed", border_style="red",
+        ))
+        return False
+
+    return True
+
+
 async def main():
     try:
+        if not await _preflight():
+            return
+
         with open(BASH_SERVER_ERRLOG, "w", encoding="utf-8") as bash_errlog:
             async with stdio_client(server_params) as (read_stream, write_stream), \
                     stdio_client(bash_server_params, errlog=bash_errlog) as (bash_read, bash_write):
