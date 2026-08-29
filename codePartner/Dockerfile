@@ -23,6 +23,13 @@ COPY agent.py bash_mcp_server.py ./
 RUN mkdir /workspace
 WORKDIR /workspace
 
+# Run as a non-root user. The run_command tool executes model-generated code;
+# root inside the container plus a bind-mounted volume means the agent can
+# clobber host files as root. Drop privileges as defence in depth.
+RUN useradd --create-home --uid 1000 agent \
+    && chown -R agent:agent /app /workspace
+USER agent
+
 # Set environment variables
 # Tell the Ollama client to look for the host machine's Ollama instance, not localhost inside the container
 ENV OLLAMA_HOST=http://host.docker.internal:11434
