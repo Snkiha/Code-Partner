@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Agent runtime artifacts
+bash_mcp_server.stderr.log
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
