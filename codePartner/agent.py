@@ -19,6 +19,7 @@ CHAT_MODEL = "qwen2.5-coder:3b"
 HEALER_MODEL = "mistral:7b"
 
 MAX_HEAL_ROUNDS = 5  # max write->output cycles before giving up
+HEAL_WRITE_RETRIES = 2  # within one round, re-prompt if the Healer narrates instead of calling a write tool
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASH_SERVER_ERRLOG = SCRIPT_DIR / "bash_mcp_server.stderr.log"
@@ -255,12 +256,75 @@ async def _run_and_capture(sessions: dict, run_cmd: str) -> tuple[bool, str]:
     return success, raw
 
 
-async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) -> None:
+HEAL_SYSTEM_PROMPT = (
+    "You are an autonomous debugging engineer. You are given the exact "
+    "stdout/stderr/exit code from a script that FAILED. Follow these steps every time:\n"
+    "1. Call read_text_file to read the current source of the script.\n"
+    "2. Find the single root cause of the error.\n"
+    "3. Call edit_file (preferred) or write_file to apply the fix to that same file. "
+    "edit_file takes a list of {oldText, newText} pairs; write_file replaces the WHOLE file, "
+    "so if you use write_file you must include the entire corrected source.\n"
+    "You are NOT finished until you have made a tool call that writes the file. "
+    "Do not run the script and do not claim success. "
+    "Once the file is written, reply with exactly: PATCHED"
+)
+
+
+async def _heal_once(
+    sessions, healer_tools, filename: str, run_cmd: str, raw_output: str, attempt: int
+) -> bool:
+    """
+    One healing round as a self-contained conversation (fresh messages each time
+    so the context stays small and focused). Returns True only if the Healer
+    actually called a file-writing tool on the target file — ground truth, not
+    the model's 'PATCHED' claim.
+    """
+    target = Path(filename).name
+
+    for retry in range(1, HEAL_WRITE_RETRIES + 1):
+        nudge = "" if retry == 1 else (
+            "\n\nYour previous reply did NOT include a write_file/edit_file tool call. "
+            "You must call the tool now — narrating the fix is not enough."
+        )
+        messages = [
+            {"role": "system", "content": HEAL_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Script: {filename}\nCommand: {run_cmd}\n"
+                f"Heal round {attempt}/{MAX_HEAL_ROUNDS} — earlier fixes have not resolved it.\n\n"
+                f"Verified failure output (not self-reported):\n{raw_output}\n\n"
+                f"Read the file, then patch it with edit_file or write_file.{nudge}"
+            )},
+        ]
+
+        _, tool_calls = await _run_tool_loop(
+            sessions, healer_tools, messages, HEALER_MODEL,
+            f"Heal-{attempt}.{retry}", max_rounds=5,
+        )
+
+        wrote_target = any(
+            name in ("write_file", "edit_file")
+            and isinstance(args, dict)
+            and args.get("path")
+            and Path(args["path"]).name == target
+            for name, args in tool_calls
+        )
+        if wrote_target:
+            return True
+
+        console.print(
+            f"[dim]Heal {attempt}.{retry}: Healer made no write to {target} — re-prompting…[/dim]"
+        )
+
+    return False
+
+
+async def run_execute_heal(sessions, healer_tools, filename: str, run_cmd: str) -> None:
     """
     Self-healing loop with independent verification:
     1. Confirm the file actually exists before doing anything.
     2. WE run the command via _run_and_capture — not the model.
-    3. If it fails, hand the REAL output to the Healer and ask only for a patch.
+    3. If it fails, hand the REAL output to the Healer and require a real patch
+       (verified by inspecting its tool calls, not its text).
     4. WE re-run and re-check. The model's claims of success are ignored.
     """
     console.print(Rule("[bold green]Executor + Self-Heal loop[/bold green]"))
@@ -272,19 +336,6 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
             title="Self-Heal aborted"
         ))
         return
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an autonomous debugging engineer. You will be given the exact "
-                "stdout/stderr/exit code from running a script. Read the error carefully, "
-                "use the file reading tool to inspect the code, and the file writing tool "
-                "to patch it. Do NOT claim success or run commands yourself — just diagnose "
-                "and patch. After patching, respond with only: 'PATCHED'."
-            )
-        }
-    ]
 
     for attempt in range(1, MAX_HEAL_ROUNDS + 1):
         console.print(f"\n[dim]── Attempt {attempt}/{MAX_HEAL_ROUNDS} ──[/dim]")
@@ -303,21 +354,15 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
         if attempt == MAX_HEAL_ROUNDS:
             break
 
-        messages.append({
-            "role": "user",
-            "content": (
-                f"Script: {filename}\n"
-                f"Command: {run_cmd}\n"
-                f"Real output (verified, not self-reported):\n{raw_output}\n\n"
-                "Patch the file to fix this. Do not run the script yourself — "
-                "just make the fix and reply 'PATCHED'."
-            )
-        })
-
-        patch_response, _ = await _run_tool_loop(
-            sessions, ollama_tools, messages, HEALER_MODEL, f"Heal-{attempt}", max_rounds=4
-        )
-        console.print(Markdown(patch_response or "*No commentary.*"))
+        patched = await _heal_once(sessions, healer_tools, filename, run_cmd, raw_output, attempt)
+        if not patched:
+            console.print(Panel(
+                "[bold yellow]⚠ The Healer did not modify the file this round[/bold yellow] "
+                f"(no verified write to {Path(filename).name} after {HEAL_WRITE_RETRIES} tries). "
+                "Small local models sometimes narrate a fix without calling the tool. "
+                "Moving to the next attempt anyway.",
+                title="Self-Heal"
+            ))
 
     console.print(Panel(
         f"[bold red]✗ Still failing after {MAX_HEAL_ROUNDS} verified attempts.[/bold red]\n"
@@ -327,7 +372,12 @@ async def run_execute_heal(sessions, ollama_tools, filename: str, run_cmd: str) 
 
 async def run_mode(sessions, ollama_tools, user_request: str) -> None:
     writer_tools = _filter_tools(ollama_tools, {"write_file"})
-    healer_tools = _filter_tools(ollama_tools, {"read_file", "write_file"})
+    # Healer needs to read the current source and patch it. edit_file (line-based
+    # oldText/newText edits) is far more reliable for a 7B model than making it
+    # regenerate the whole file through write_file.
+    healer_tools = _filter_tools(
+        ollama_tools, {"read_text_file", "read_file", "edit_file", "write_file"}
+    )
 
     _, filename = await run_writer(sessions, writer_tools, user_request)
     if not filename:
@@ -397,7 +447,7 @@ def _build_messages(base_messages: list) -> list:
 
 async def review_mode(sessions, ollama_tools, user_request: str) -> None:
     writer_tools = _filter_tools(ollama_tools, {"write_file"})
-    reviewer_tools = _filter_tools(ollama_tools, {"read_file", "write_file"})
+    reviewer_tools = _filter_tools(ollama_tools, {"read_text_file", "read_file", "write_file"})
 
     _, filename = await run_writer(sessions, writer_tools, user_request)
 
