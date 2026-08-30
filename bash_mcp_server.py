@@ -28,7 +28,7 @@ from mcp.types import Tool, TextContent
 
 # -- CONFIGURATION -- #
 CWD_ROOT = Path(os.getcwd()).resolve()
-DEFAULT_TIMEOUT = 30 # 30 seconds
+DEFAULT_TIMEOUT = 20 # seconds — a single script that needs longer should pass `timeout` explicitly
 MAX_OUTPUT_CHARS = 12_000 # truncate runaway output
 
 ALLOW_ALL = os.getenv("BASH_MCP_ALLOW_ALL", "0") == "1"
