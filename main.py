@@ -2,6 +2,7 @@ import ast
 import asyncio
 import json
 import os
+import shlex
 import sys
 
 # The UI (rich panels, rules) uses box-drawing chars and emoji. On Windows those
@@ -23,52 +24,76 @@ from rich.rule import Rule
 from pathlib import Path
 
 console = Console()
-ollama_client = AsyncClient()
-
-# These small local models rarely emit a *structured* Ollama tool call — they
-# tend to write the call as JSON text in the message body (recovered by
-# _recover_text_tool_call) and qwen sometimes echoes the tool schema back as a
-# string (rejected by the Writer content gate). Narrating a fix as prose is
-# handled by the require_tool nudge. Pick a coder model for anything that writes
-# code; the tiny model is only good enough for the conversational path.
-WRITER_MODEL = "qwen2.5-coder:7b"
-REVIEWER_MODEL = "qwen2.5-coder:7b"
-CHAT_MODEL = "qwen3.5:0.8b"
-HEALER_MODEL = "qwen2.5-coder:7b"
-
-MAX_HEAL_ROUNDS = 3  # write->run->diagnose cycles before giving up (a 7B model that hasn't fixed it in 3 won't in 5)
-HEAL_WRITE_RETRIES = 1  # _run_tool_loop already nudges a prose-only Healer back on task within the round
+ollama_client = AsyncClient(host=os.environ.get("OLLAMA_HOST") or None)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASH_SERVER_ERRLOG = SCRIPT_DIR / "bash_mcp_server.stderr.log"
 
-# The Writer / Reviewer / Healer only ever read and write inside this directory,
-# so a model that decides to "scaffold a project" can't clobber main.py, the
-# README, requirements.txt or .git. Kept relative so `python WORKSPACE/x.py`
-# works through the bash sandbox (which is rooted at the repo).
-WORKSPACE_NAME = "workspace"
-WORKSPACE_DIR = SCRIPT_DIR / WORKSPACE_NAME
+# ---------------------------------------------------------------------------
+# Configuration. Every value can be set via an environment variable (see
+# .env.example) or a CLI flag (see --help). Flags are folded into the
+# environment before _load_config() runs, so flags win.
+# ---------------------------------------------------------------------------
 
-# Define the MCP Server parameters.
-# Pin the filesystem server version — an unpinned "@latest" via npx means a
-# silent dependency upgrade (and potential tool-name/behaviour drift) on any run.
-FS_SERVER_PKG = "@modelcontextprotocol/server-filesystem@2026.7.10"
-server_params = StdioServerParameters(
-    command="npx",
-    args=["-y", FS_SERVER_PKG, os.getcwd()]
-)
+def _env(name: str, default: str) -> str:
+    val = os.environ.get(name)
+    return val.strip() if val and val.strip() else default
 
-# IMPORTANT: use sys.executable, not a re-resolved "python"/"python3" from PATH.
-# shutil.which("python") can find a *different* interpreter (e.g. the Windows
-# Store alias, or another install) that doesn't have `mcp` installed, which
-# makes the subprocess crash on import before it ever prints anything —
-# the symptom is a ClosedResourceError with no visible traceback.
-# Path is made absolute so this also doesn't depend on the cwd you launch from.
-bash_server_params = StdioServerParameters(
-    command=sys.executable,
-    args=[str(SCRIPT_DIR / "bash_mcp_server.py")],
-    cwd=str(SCRIPT_DIR),
-)
+
+def _flag(name: str) -> bool:
+    return _env(name, "0").lower() not in ("0", "false", "no", "off", "")
+
+
+def _load_config() -> None:
+    """(Re)read config from the environment into module globals. Called once at
+    import, and again by cli() after flags have been merged into os.environ."""
+    global CODER_MODEL, WRITER_MODEL, REVIEWER_MODEL, HEALER_MODEL, CHAT_MODEL
+    global MAX_HEAL_ROUNDS, HEAL_WRITE_RETRIES, AUTO_PULL
+    global PROJECT_DIR, WORKSPACE_NAME, WORKSPACE_DIR, FS_SERVER_PKG
+    global server_params, bash_server_params
+
+    # One capable coder model backs Writer / Reviewer / Healer — and Chat too by
+    # default, so a first-time user only has to pull a single model. Override any
+    # role individually (e.g. CP_CHAT_MODEL=qwen2.5-coder:3b for snappier chat).
+    # These small models rarely emit a *structured* Ollama tool call; the host
+    # recovers the JSON-in-text ones and nudges past prose-only replies.
+    CODER_MODEL    = _env("CP_CODER_MODEL", "qwen2.5-coder:7b")
+    WRITER_MODEL   = _env("CP_WRITER_MODEL", CODER_MODEL)
+    REVIEWER_MODEL = _env("CP_REVIEWER_MODEL", CODER_MODEL)
+    HEALER_MODEL   = _env("CP_HEALER_MODEL", CODER_MODEL)
+    CHAT_MODEL     = _env("CP_CHAT_MODEL", CODER_MODEL)
+
+    MAX_HEAL_ROUNDS    = int(_env("CP_MAX_HEAL_ROUNDS", "3"))
+    HEAL_WRITE_RETRIES = int(_env("CP_HEAL_WRITE_RETRIES", "1"))
+    AUTO_PULL          = _flag("CP_AUTO_PULL")
+
+    # The project root the agent may read/write and run code in. Defaults to the
+    # directory you launched from. The Writer / Reviewer / Healer are further
+    # confined to <root>/<workspace>; only the chat agent sees the whole root.
+    PROJECT_DIR    = Path(_env("CP_PROJECT_DIR", os.getcwd())).resolve()
+    WORKSPACE_NAME = _env("CP_WORKSPACE", "workspace")
+    WORKSPACE_DIR  = PROJECT_DIR / WORKSPACE_NAME
+
+    # Pinned so an `npx` run can't silently upgrade the filesystem server and
+    # drift its tool names/behaviour underneath us.
+    FS_SERVER_PKG = _env("CP_FS_SERVER_PKG", "@modelcontextprotocol/server-filesystem@2026.7.10")
+
+    server_params = StdioServerParameters(
+        command="npx",
+        args=["-y", FS_SERVER_PKG, str(PROJECT_DIR)],
+    )
+    # sys.executable, not a PATH lookup: shutil.which("python") can resolve to a
+    # different interpreter (Windows Store alias, another install) that lacks
+    # `mcp`, and the subprocess then dies on import with no traceback.
+    bash_server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(SCRIPT_DIR / "bash_mcp_server.py")],
+        cwd=str(PROJECT_DIR),
+        env={**os.environ, "BASH_MCP_ROOT": str(PROJECT_DIR)},
+    )
+
+
+_load_config()
 
 # --HELPER FUNCTIONS-- #
 
@@ -793,15 +818,33 @@ async def _preflight() -> bool:
             available.add(name.split(":", 1)[0])  # tolerate an implicit ":latest"
 
     missing = [m for m in required if m not in available and m.split(":", 1)[0] not in available]
-    if missing:
+    if not missing:
+        return True
+
+    if not AUTO_PULL:
         pulls = "\n".join(f"  ollama pull {m}" for m in missing)
         console.print(Panel(
             f"[bold red]Missing Ollama models:[/bold red] {', '.join(missing)}\n\n"
-            f"Pull them first:\n{pulls}",
+            f"Pull them first:\n{pulls}\n\n"
+            "or re-run with [bold]--pull[/bold] (or CP_AUTO_PULL=1) to fetch them now.",
             title="Preflight failed", border_style="red",
         ))
         return False
 
+    for m in missing:
+        console.print(f"[cyan]Pulling [bold]{m}[/bold] — first run only, this can take a while…[/cyan]")
+        try:
+            async for part in await ollama_client.pull(m, stream=True):
+                status = getattr(part, "status", "")
+                if status:
+                    console.print(f"[dim]  {m}: {status}[/dim]", end="\r")
+        except Exception as exc:
+            console.print(Panel(
+                f"[bold red]Could not pull {m}:[/bold red] {exc}",
+                title="Preflight failed", border_style="red",
+            ))
+            return False
+        console.print(f"[green]✓ {m} ready[/green]" + " " * 40)
     return True
 
 
@@ -913,5 +956,75 @@ async def main():
         traceback.print_exc()
         return
 
-if __name__ == "__main__":
+def _load_dotenv() -> None:
+    """Minimal .env loader (no dependency): KEY=VALUE lines from ./.env, only for
+    keys not already set in the real environment."""
+    path = Path.cwd() / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def cli() -> None:
+    """Console entry point. Parses flags, folds them into the environment so
+    _load_config() picks them up, then runs the interactive session."""
+    import argparse
+
+    _load_dotenv()
+
+    p = argparse.ArgumentParser(
+        prog="code-partner",
+        description="Local terminal coding partner (MCP + Ollama). "
+                    "In-session: --run <task>, --review <task>, +pin <path>, or just chat.",
+    )
+    p.add_argument("--model", metavar="NAME",
+                   help="model for every role (default: qwen2.5-coder:7b)")
+    p.add_argument("--chat-model", metavar="NAME", help="override just the chat model")
+    p.add_argument("--writer-model", metavar="NAME", help="override just the writer model")
+    p.add_argument("--project", metavar="DIR",
+                   help="project root the agent may read/write (default: current directory)")
+    p.add_argument("--workspace", metavar="NAME", default=None,
+                   help="subdir under the project root for generated code (default: workspace)")
+    p.add_argument("--ollama-host", metavar="URL",
+                   help="Ollama base URL (default: http://localhost:11434 or $OLLAMA_HOST)")
+    p.add_argument("--timeout", type=int, metavar="SECONDS",
+                   help="per-command execution timeout for generated code")
+    p.add_argument("--allow", metavar="CMD[,CMD...]",
+                   help="extra executables the run sandbox may invoke")
+    p.add_argument("--allow-all", action="store_true",
+                   help="disable the command allowlist entirely (trusted envs only)")
+    p.add_argument("--pull", action="store_true",
+                   help="download any missing models automatically on startup")
+    args = p.parse_args()
+
+    env = {
+        "CP_CODER_MODEL": args.model,
+        "CP_CHAT_MODEL": args.chat_model or args.model,
+        "CP_WRITER_MODEL": args.writer_model or args.model,
+        "CP_PROJECT_DIR": args.project,
+        "CP_WORKSPACE": args.workspace,
+        "OLLAMA_HOST": args.ollama_host,
+        "BASH_MCP_TIMEOUT": str(args.timeout) if args.timeout else None,
+        "BASH_MCP_ALLOWED_EXTRA": args.allow,
+        "BASH_MCP_ALLOW_ALL": "1" if args.allow_all else None,
+        "CP_AUTO_PULL": "1" if args.pull else None,
+    }
+    for k, v in env.items():
+        if v:
+            os.environ[k] = v
+
+    global ollama_client
+    ollama_client = AsyncClient(host=os.environ.get("OLLAMA_HOST") or None)
+    _load_config()
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
