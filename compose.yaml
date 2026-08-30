@@ -1,0 +1,44 @@
+# One command to run everything, including Ollama and the model download:
+#
+#   docker compose run --rm agent                 # agent works on THIS repo
+#   CP_PROJECT=~/code/my-app docker compose run --rm agent   # ...or your project
+#
+# The mounted directory is the agent's project root: what it reads, writes and
+# runs code in. Generated code lands in <root>/workspace.
+#
+# GPU: uncomment the `deploy` block under `ollama` if you have nvidia-container-toolkit.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"          # also reachable from the host
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - { driver: nvidia, count: all, capabilities: [gpu] }
+
+  agent:
+    build: .
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      CP_CODER_MODEL: ${CP_CODER_MODEL:-qwen2.5-coder:7b}
+      CP_AUTO_PULL: "1"         # pulls the model into the ollama volume on first run
+    volumes:
+      - ${CP_PROJECT:-./}:/project    # agent's project root (default: this repo)
+    stdin_open: true                  # keep STDIN open for the REPL
+    tty: true
+
+volumes:
+  ollama-models:

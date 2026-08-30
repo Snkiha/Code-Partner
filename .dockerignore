@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+workspace/
+bash_mcp_server.stderr.log
+graphify-out/
+.env
+*.md
+!README.md
+Dockerfile
+compose.yaml
+.dockerignore

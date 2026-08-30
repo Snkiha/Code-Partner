@@ -1,37 +1,29 @@
-# Start with a lightweight Python image
+# syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-# Install Node.js (required for the npx filesystem MCP server)
-RUN apt-get update && apt-get install -y \
-    nodejs \
-    npm \
+# Node is only needed for the MCP filesystem server, which we install at build
+# time so the container needs no network access at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+    && npm install -g @modelcontextprotocol/server-filesystem@2026.7.10 \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up the internal application directory
 WORKDIR /app
-
-# Copy the dependency list and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the agent scripts into the container
 COPY main.py bash_mcp_server.py ./
 
-# Create a designated "sandbox" directory for the agent to work in.
-# We will mount the user's local code directory here.
-RUN mkdir /workspace
-WORKDIR /workspace
-
-# Run as a non-root user. The run_command tool executes model-generated code;
-# root inside the container plus a bind-mounted volume means the agent can
-# clobber host files as root. Drop privileges as defence in depth.
-RUN useradd --create-home --uid 1000 agent \
-    && chown -R agent:agent /app /workspace
+# The agent reads/writes and runs code under /project (bind-mount your code
+# there). Generated code is confined to /project/workspace.
+RUN mkdir /project && useradd --create-home --uid 1000 agent \
+    && chown -R agent:agent /app /project
 USER agent
+WORKDIR /project
 
-# Set environment variables
-# Tell the Ollama client to look for the host machine's Ollama instance, not localhost inside the container
-ENV OLLAMA_HOST=http://host.docker.internal:11434
+ENV OLLAMA_HOST=http://host.docker.internal:11434 \
+    CP_PROJECT_DIR=/project \
+    CP_FS_SERVER_CMD=mcp-server-filesystem \
+    CP_AUTO_PULL=1 \
+    PYTHONUNBUFFERED=1
 
-# Run the agent script from the /app directory while working inside /workspace
-CMD ["python", "/app/main.py"]
+ENTRYPOINT ["python", "/app/main.py"]
