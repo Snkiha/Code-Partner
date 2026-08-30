@@ -36,8 +36,8 @@ REVIEWER_MODEL = "qwen2.5-coder:7b"
 CHAT_MODEL = "qwen3.5:0.8b"
 HEALER_MODEL = "qwen2.5-coder:7b"
 
-MAX_HEAL_ROUNDS = 5  # max write->output cycles before giving up
-HEAL_WRITE_RETRIES = 2  # within one round, re-prompt if the Healer narrates instead of calling a write tool
+MAX_HEAL_ROUNDS = 3  # write->run->diagnose cycles before giving up (a 7B model that hasn't fixed it in 3 won't in 5)
+HEAL_WRITE_RETRIES = 1  # _run_tool_loop already nudges a prose-only Healer back on task within the round
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASH_SERVER_ERRLOG = SCRIPT_DIR / "bash_mcp_server.stderr.log"
@@ -202,6 +202,23 @@ def _sandbox_path(raw_path: str, sandbox: str) -> str:
     return f"{sandbox}/{Path(str(raw_path)).name}"
 
 
+OLLAMA_KEEP_ALIVE = "15m"  # keep the model resident between Writer→Executor→Healer so it never reloads mid-pipeline
+CTX_MIN, CTX_MAX = 4096, 16384
+
+
+def _estimate_ctx(messages: list, ollama_tools: list) -> int:
+    """
+    Size the context window to the actual prompt instead of always forcing 16k.
+    A 7B model processes a 16k window several times slower than a 4k one, and the
+    Writer / Healer conversations are tiny (a prompt + one file + an error dump).
+    ~4 chars/token, then double for headroom + the model's own reply.
+    """
+    chars = sum(len(str(m.get("content", ""))) for m in messages if isinstance(m, dict))
+    chars += sum(len(str(t)) for t in ollama_tools)
+    need = (chars // 4) * 2 + 512
+    return max(CTX_MIN, min(CTX_MAX, 1 << (need - 1).bit_length()))  # round up to a power of two
+
+
 async def _run_tool_loop(
     sessions: dict, ollama_tools: list, messages: list, model: str, label: str,
     *, max_rounds: int = 6, require_tool: set[str] | None = None,
@@ -223,13 +240,15 @@ async def _run_tool_loop(
     '<write_sandbox>/<basename>' before the call.
     """
     tool_calls_made: list = []
+    num_ctx = _estimate_ctx(messages, ollama_tools)
 
     for _ in range(max_rounds):
         response = await ollama_client.chat(
             model=model,
             messages=messages,
             tools=ollama_tools,
-            options={"num_ctx": 16384, "temperature": 0.1}  # Forces a larger memory buffer
+            options={"num_ctx": num_ctx, "temperature": 0.1},
+            keep_alive=OLLAMA_KEEP_ALIVE,
         )
 
         # Normalise structured tool_calls and text-embedded ones into one list.
@@ -312,8 +331,14 @@ async def _run_tool_loop(
         if require_tool and any(n in require_tool for n, _ in tool_calls_made):
             return response.message.content or "", tool_calls_made
 
-    # Max rounds hit - ask for final summary with no tools
-    final = await ollama_client.chat(model=model, messages=messages, options={"num_ctx": 16384})
+    # Max rounds hit. Only the conversational agent needs a prose wrap-up; for the
+    # tool-driven agents that final no-tools call is pure latency we never read.
+    if require_tool:
+        return "", tool_calls_made
+    final = await ollama_client.chat(
+        model=model, messages=messages,
+        options={"num_ctx": num_ctx}, keep_alive=OLLAMA_KEEP_ALIVE,
+    )
     messages.append(final.message)
     return final.message.content or "", tool_calls_made
 
@@ -516,6 +541,11 @@ async def _run_and_capture(sessions: dict, run_cmd: str) -> tuple[bool, str]:
     return False, raw + "\n[warning: could not find an 'Exit code:' line to verify success]"
 
 
+def _timed_out(raw_output: str) -> bool:
+    """The bash server reports a kill-by-timeout as this line."""
+    return "command timed out after" in raw_output
+
+
 HEAL_SYSTEM_PROMPT = (
     "You are an autonomous debugging engineer. You are given the exact "
     "stdout/stderr/exit code from a script that FAILED. Follow these steps every time:\n"
@@ -558,7 +588,7 @@ async def _heal_once(
 
         _, tool_calls = await _run_tool_loop(
             sessions, healer_tools, messages, HEALER_MODEL,
-            f"Heal-{attempt}.{retry}", max_rounds=5,
+            f"Heal-{attempt}.{retry}", max_rounds=3,
             require_tool={"write_file", "edit_file"}, write_sandbox=WORKSPACE_NAME,
         )
 
@@ -608,6 +638,19 @@ async def run_execute_heal(sessions, healer_tools, filename: str, run_cmd: str) 
             console.print(Panel(
                 f"[bold green]✓ Script verified working after {attempt} attempt(s) "
                 f"(exit code 0, confirmed independently).[/bold green]",
+                title="Self-Heal"
+            ))
+            return
+
+        # A script that only ever times out is almost always a server / long-
+        # running / interactive program, not a bug. Re-running it 3× and asking a
+        # model to "fix" it just burns one timeout per round for no reason.
+        if _timed_out(raw_output):
+            console.print(Panel(
+                "[bold yellow]⚠ The script did not exit on its own[/bold yellow] — it timed out. "
+                "That usually means it's a server or an interactive program, which the "
+                "self-heal loop can't verify. Stopping here; run it yourself if it's meant "
+                "to stay running.",
                 title="Self-Heal"
             ))
             return
