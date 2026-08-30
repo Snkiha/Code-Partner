@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-partner"
+version = "0.1.0"
+description = "Local terminal coding partner — a sandboxed MCP + Ollama pair programmer"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Kishanveer Singh" }]
+keywords = ["llm", "ollama", "mcp", "coding-agent", "local", "cli"]
+dependencies = [
+    "ollama==0.6.2",
+    "mcp==1.27.1",
+    "rich==14.3.3",
+]
+
+[project.scripts]
+code-partner = "main:cli"
+
+[project.urls]
+Homepage = "https://github.com/kishanveersingh/code-partner"
+
+[tool.setuptools]
+py-modules = ["main", "bash_mcp_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

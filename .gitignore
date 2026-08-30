@@ -10,10 +10,15 @@ venv/
 .coverage
 htmlcov/
 
+# Local config (keep .env.example tracked)
+.env
+
 # Agent runtime artifacts
 bash_mcp_server.stderr.log
 # Everything the Writer / Reviewer / Healer generate
 workspace/
+dist/
+build/
 
 # Node
 node_modules/
