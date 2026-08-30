@@ -7,14 +7,18 @@ Tools exposed:
         Runs a shell command, captures stdout + stderr, returns both with
         the exit code. The client (LLM) can see errors and patch its own code.
 
+Configuration (environment variables):
+    • BASH_MCP_ROOT           project root; commands may not escape it (default: cwd)
+    • BASH_MCP_TIMEOUT        default per-command timeout in seconds (default: 20)
+    • BASH_MCP_ALLOWED_EXTRA  comma-separated extra executables to allow
+    • BASH_MCP_ALLOW_ALL=1    skip the allowlist entirely — trusted envs only
+
 Security notes (read before deploying):
     • ALLOWED_COMMANDS whitelist restricts which executables may run.
-    Add or remove entries to match your project's needs.
-    • working_dir is restricted to CWD_ROOT (defaults to the directory
-    this server is launched from). Path traversal attempts are rejected.
+    • working_dir is restricted to BASH_MCP_ROOT. Path traversal is rejected.
     • Shell interpolation is disabled (shell=False via shlex.split).
-    • Set BASH_MCP_ALLOW_ALL=1 env var ONLY in fully trusted local environments
-    to skip the whitelist (useful during dev, dangerous in production).
+    • The allowlist still permits interpreters (python, node, …) that can run
+      arbitrary code — run this in a container / VM for anything untrusted.
 """
 
 import asyncio
@@ -27,38 +31,21 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # -- CONFIGURATION -- #
-CWD_ROOT = Path(os.getcwd()).resolve()
-DEFAULT_TIMEOUT = 20 # seconds — a single script that needs longer should pass `timeout` explicitly
-MAX_OUTPUT_CHARS = 12_000 # truncate runaway output
+CWD_ROOT = Path(os.getenv("BASH_MCP_ROOT") or os.getcwd()).resolve()
+DEFAULT_TIMEOUT = int(os.getenv("BASH_MCP_TIMEOUT") or 20)  # a script needing longer should pass `timeout`
+MAX_OUTPUT_CHARS = 12_000  # truncate runaway output
 
 ALLOW_ALL = os.getenv("BASH_MCP_ALLOW_ALL", "0") == "1"
 
 # Executables the LLM is allowed to invoke
 ALLOWED_COMMANDS: set[str] = {
-    "python",
-    "node",
-    "npm",
-    "npx",
-    "pytest",
-    "pip",
-    "pip3",
-    "ruff",
-    "mypy",
-    "black",
-    "isort",
-    "eslint",
-    "tsc",
-    "cargo",
-    "go",
-    "make",
-    "ls",
-    "cat",
-    "echo",
-    "grep",
-    "find",
-    "head",
-    "tail",
-    "diff"
+    "python", "python3", "node", "npm", "npx", "pytest",
+    "pip", "pip3", "uv", "ruff", "mypy", "black", "isort",
+    "eslint", "tsc", "cargo", "go", "make",
+    "ls", "cat", "echo", "grep", "find", "head", "tail", "diff", "wc",
+}
+ALLOWED_COMMANDS |= {
+    c.strip() for c in (os.getenv("BASH_MCP_ALLOWED_EXTRA") or "").split(",") if c.strip()
 }
 
 # -- SERVER SETUP-- #
