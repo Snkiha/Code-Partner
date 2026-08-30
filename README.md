@@ -1,88 +1,118 @@
 # Local Terminal Coding Partner (MCP + Ollama)
 
-A private, lightweight, and blazing-fast terminal-based pair programmer that runs 100% locally on your machine. This project utilizes the **Model Context Protocol (MCP)** to securely bridge a local inference engine (**Ollama**) to your computer's filesystem, transforming an isolated LLM into an active, tool-capable programming partner.
+A private, terminal-based pair programmer that runs **100% locally**. It bridges
+a local model (via [Ollama](https://ollama.com/)) to your filesystem and a
+sandboxed shell using the **Model Context Protocol (MCP)**, so the model can
+read your code, write scripts, run them, and fix its own mistakes.
 
-## 🚀 Features
-
-- **100% Local & Private:** No API keys required, and your code never leaves your local machine.
-- **Native Filesystem Access:** Powered by the official MCP Filesystem Server, allowing the model to list directories, read source code, create scripts, and write patches.
-- **Optimized Tool-Calling Architecture:** Tailored handling for local models to prevent structural failure, with automated fallbacks to capture typed plain-text tool blocks.
-- **Robust Memory Guardrails:** Programmatically forces expanded context windows (`num_ctx: 16384`) so complex tool schemas don't cause model memory collapse.
-- **Beautiful Terminal Interface:** Powered by `rich` for elegant markdown parsing, syntax highlighting, and visual execution statuses.
-
----
-
-## 🛠️ Architecture Blueprint
-
-The framework acts as an agentic loop implementing the **ReAct (Reason + Action)** pattern:
-
-1. **User Input** is processed and appended to a persistent conversation history.
-2. The python client wraps the history alongside the available **MCP Tool Schemas** and targets **Ollama**.
-3. **Ollama** decides whether it needs an external resource to fulfill the request.
-4. If a tool call is generated, the python host intercepts the instruction, transfers execution to the background **MCP Server** via standard input/output (`stdio`), and returns the raw file/directory data to the LLM.
-5. The LLM reviews the resource data and delivers the finalized fix back to your terminal window.
+- **Local & private** — no API keys, nothing leaves your machine.
+- **`--run`** — writes a script, executes it, and self-heals on failure with
+  independently verified exit codes (the model's "it works" claims are ignored).
+- **`--review`** — writes a script, then a second agent reviews it.
+- **Sandboxed** — generated code is confined to a `workspace/` dir and an
+  allow-listed set of commands; it can't touch your source tree.
 
 ---
 
-## 📦 Prerequisites
+## Quickstart
 
-Before getting started, ensure you have the following environmental engines installed:
+### Option A — Docker (nothing to install but Docker)
 
-1. **Ollama:** Download and run [Ollama](https://ollama.com/) locally.
-2. **Node.js (v18+):** Required to run the background filesystem server dependencies over `npx`. Check compatibility using:
-   ```bash
-   node -v
-   npx -v
+```bash
+git clone <this-repo> && cd "Code Partner"
+docker compose run --rm agent
+```
 
-## Install Python Dependencies
+That starts Ollama, downloads the model on first run (~5 GB, cached in a volume),
+builds the agent, and drops you into the session. To point it at another project:
 
-Requires **Python 3.11+** (uses `ExceptionGroup` handling).
+```bash
+CP_PROJECT=~/code/my-app docker compose run --rm agent
+```
+
+### Option B — Local (you run Ollama yourself)
+
+**Prerequisites:** Python 3.11+, Node.js 18+, and [Ollama](https://ollama.com/) running.
 
 ```bash
 pip install -r requirements.txt
+python main.py --pull          # --pull downloads missing models automatically
 ```
 
-## Running the Agent
-```bash
-python main.py
-```
+---
 
-Commands inside the session:
+## Using it
 
-| Command | Effect |
+Once in the session:
+
+| Input | What happens |
 | --- | --- |
-| `--run <request>` | Writer → Execute → Self-Heal loop |
-| `--review <request>` | Writer → Reviewer pipeline |
-| `+pin <path>` / `+unpin <path>` / `+pins` | Manage permanent-context files |
-| anything else | Conversational agent (full filesystem + bash access) |
+| `--run <task>` | Writer → Execute → Self-Heal loop |
+| `--review <task>` | Writer → Reviewer (writes `workspace/<name>.review.md`) |
+| `+pin <path>` / `+unpin <path>` / `+pins` | Keep a file in context permanently |
+| anything else | Conversational agent with full project + shell access |
+| `exit` | Quit |
 
-The Writer / Reviewer / Healer only ever read and write inside a `workspace/`
-directory (git-ignored), so a run can't overwrite your source, `README.md`, or
-`requirements.txt`. The conversational agent still has full repo access.
+The Writer / Reviewer / Healer only read and write inside `workspace/` (git-ignored),
+so a run can never overwrite your source, README or `requirements.txt`. Only the
+conversational agent sees the whole project.
 
-## Docker Deployment
-```bash 
-docker build -t local-coder .
-```
-### Running the Sandbox
+---
 
-The `run_command` tool executes model-generated code, so run the container with
-the tightest limits your workflow allows:
+## Configuration
+
+Every setting has an env var and most have a CLI flag (`python main.py --help`).
+Copy [`.env.example`](.env.example) to `.env` or export the vars.
+
+| Env | Flag | Default | Purpose |
+| --- | --- | --- | --- |
+| `CP_CODER_MODEL` | `--model` | `qwen2.5-coder:7b` | model for every role |
+| `CP_CHAT_MODEL` | `--chat-model` | = coder model | override just chat (e.g. `qwen2.5-coder:3b`) |
+| `CP_PROJECT_DIR` | `--project` | current dir | root the agent may read/write |
+| `CP_WORKSPACE` | `--workspace` | `workspace` | subdir for generated code |
+| `OLLAMA_HOST` | `--ollama-host` | `http://localhost:11434` | Ollama URL |
+| `BASH_MCP_TIMEOUT` | `--timeout` | `20` | per-command timeout (seconds) |
+| `BASH_MCP_ALLOWED_EXTRA` | `--allow` | — | extra executables the run sandbox may call |
+| `CP_AUTO_PULL` | `--pull` | `0` | download missing models on startup |
+
+---
+
+## Docker: hardening a standalone container
+
+The Compose setup is the easy path. To run the image directly with tight limits:
 
 ```bash
-docker run -it \
+docker build -t code-partner .
+docker run -it --rm \
   --add-host=host.docker.internal:host-gateway \
-  -v "$(pwd)/my_project:/workspace" \
-  --pids-limit=256 \
-  --memory=2g \
-  --cpus=2 \
+  -v "$PWD:/project" \
+  --network none \
+  --pids-limit=256 --memory=2g --cpus=2 \
   --read-only --tmpfs /tmp \
-  local-coder
+  code-partner
 ```
 
-Notes:
-- `--pids-limit` contains fork bombs; `--memory` / `--cpus` cap runaway processes.
-- Omit `--network none` only because the filesystem MCP server is fetched via
-  `npx` at startup. If you bake it into the image, add `--network none` to cut
-  off package downloads and exfiltration entirely.
-- The container already runs as a non-root `agent` user.
+`--network none` works because the MCP filesystem server is baked into the image.
+It talks to Ollama on the host via `host.docker.internal`; drop `--network none`
+if Ollama is elsewhere.
+
+---
+
+## How it works
+
+An agentic loop (ReAct): the Python host sends the conversation + MCP tool
+schemas to Ollama; when the model asks for a tool, the host runs it against the
+filesystem or bash MCP server over stdio and feeds the result back. Small local
+models rarely emit a *structured* tool call, so the host also recovers tool calls
+written as JSON text and nudges past prose-only replies. For `--run`, the host —
+not the model — executes the script and checks the real exit code before
+declaring success.
+
+## Limitations
+
+- The `--run` pipeline is **Python-only** (`python <file>`); other languages
+  in the allowlist aren't wired into it yet.
+- Self-heal catches **crashes, not wrong answers** — a script that runs but
+  produces an incorrect result is reported as "verified working".
+- The command allowlist permits interpreters (`python`, `node`, …) that can run
+  arbitrary code — use the container for anything you don't trust.
