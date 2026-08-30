@@ -1,1 +1,5 @@
-csv
+# Pinned to the versions this project is developed against.
+# The MCP SDK in particular changes APIs frequently between minor releases.
+ollama==0.6.2
+mcp==1.27.1
+rich==14.3.3

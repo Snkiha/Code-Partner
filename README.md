@@ -39,13 +39,26 @@ Before getting started, ensure you have the following environmental engines inst
 Requires **Python 3.11+** (uses `ExceptionGroup` handling).
 
 ```bash
-pip install -r codePartner/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Running the Agent
-```bash 
-python agent.py
+```bash
+python main.py
 ```
+
+Commands inside the session:
+
+| Command | Effect |
+| --- | --- |
+| `--run <request>` | Writer → Execute → Self-Heal loop |
+| `--review <request>` | Writer → Reviewer pipeline |
+| `+pin <path>` / `+unpin <path>` / `+pins` | Manage permanent-context files |
+| anything else | Conversational agent (full filesystem + bash access) |
+
+The Writer / Reviewer / Healer only ever read and write inside a `workspace/`
+directory (git-ignored), so a run can't overwrite your source, `README.md`, or
+`requirements.txt`. The conversational agent still has full repo access.
 
 ## Docker Deployment
 ```bash 

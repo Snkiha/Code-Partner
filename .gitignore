@@ -12,6 +12,8 @@ htmlcov/
 
 # Agent runtime artifacts
 bash_mcp_server.stderr.log
+# Everything the Writer / Reviewer / Healer generate
+workspace/
 
 # Node
 node_modules/

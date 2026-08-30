@@ -14,9 +14,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your agent scripts into the container
-# NOTE: Replace 'agent.py' with whatever you named your main file
-COPY agent.py bash_mcp_server.py ./
+# Copy the agent scripts into the container
+COPY main.py bash_mcp_server.py ./
 
 # Create a designated "sandbox" directory for the agent to work in.
 # We will mount the user's local code directory here.
@@ -35,4 +34,4 @@ USER agent
 ENV OLLAMA_HOST=http://host.docker.internal:11434
 
 # Run the agent script from the /app directory while working inside /workspace
-CMD ["python", "/app/agent.py"]
+CMD ["python", "/app/main.py"]

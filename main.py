@@ -25,13 +25,14 @@ from pathlib import Path
 console = Console()
 ollama_client = AsyncClient()
 
-# mistral:7b is the most reliable *structured* tool-caller of the small local
-# models tried here (qwen2.5-coder:7b tends to echo the tool schema back as a
-# string). Its weak spots — narrating a fix as prose, or emitting the call as
-# JSON text, or mangling indentation — are handled downstream by the text
-# tool-call recovery, the require_tool nudge, and the Writer syntax gate.
+# These small local models rarely emit a *structured* Ollama tool call — they
+# tend to write the call as JSON text in the message body (recovered by
+# _recover_text_tool_call) and qwen sometimes echoes the tool schema back as a
+# string (rejected by the Writer content gate). Narrating a fix as prose is
+# handled by the require_tool nudge. Pick a coder model for anything that writes
+# code; the tiny model is only good enough for the conversational path.
 WRITER_MODEL = "qwen2.5-coder:7b"
-REVIEWER_MODEL = "qwen3.5:0.8b"
+REVIEWER_MODEL = "qwen2.5-coder:7b"
 CHAT_MODEL = "qwen3.5:0.8b"
 HEALER_MODEL = "qwen2.5-coder:7b"
 
@@ -40,6 +41,13 @@ HEAL_WRITE_RETRIES = 2  # within one round, re-prompt if the Healer narrates ins
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASH_SERVER_ERRLOG = SCRIPT_DIR / "bash_mcp_server.stderr.log"
+
+# The Writer / Reviewer / Healer only ever read and write inside this directory,
+# so a model that decides to "scaffold a project" can't clobber main.py, the
+# README, requirements.txt or .git. Kept relative so `python WORKSPACE/x.py`
+# works through the bash sandbox (which is rooted at the repo).
+WORKSPACE_NAME = "workspace"
+WORKSPACE_DIR = SCRIPT_DIR / WORKSPACE_NAME
 
 # Define the MCP Server parameters.
 # Pin the filesystem server version — an unpinned "@latest" via npx means a
@@ -185,9 +193,19 @@ def _recover_text_tool_call(content: str) -> tuple[str, dict] | None:
     return name, {k: _unwrap_arg(v) for k, v in raw_args.items()}
 
 
+_WRITE_TOOLS = {"write_file", "edit_file"}
+
+
+def _sandbox_path(raw_path: str, sandbox: str) -> str:
+    """Force a tool's target path to '<sandbox>/<basename>' so the codegen agents
+    can never overwrite the user's own source, README, requirements.txt, .git…"""
+    return f"{sandbox}/{Path(str(raw_path)).name}"
+
+
 async def _run_tool_loop(
     sessions: dict, ollama_tools: list, messages: list, model: str, label: str,
     *, max_rounds: int = 6, require_tool: set[str] | None = None,
+    write_sandbox: str | None = None,
 ) -> tuple[str, list]:
     """
     Drive a single agent through up to 'max_rounds' of tool-call cycles.
@@ -196,9 +214,13 @@ async def _run_tool_loop(
     this instead of parsing the model's natural-language summary.
 
     require_tool: if given, a text-only response does NOT end the loop until at
-    least one of those tools has actually been called. Small local models love
-    to answer "the fix is X" in prose without ever emitting the tool call; this
-    nudges them back on task instead of returning an empty-handed result.
+    least one of those tools has actually been called (small local models love to
+    answer "the fix is X" in prose without emitting the call). Once a required
+    tool HAS been called the loop returns immediately — these models otherwise
+    re-emit the same call every round because they don't register the tool result.
+
+    write_sandbox: if given, every write_file/edit_file path is rewritten to
+    '<write_sandbox>/<basename>' before the call.
     """
     tool_calls_made: list = []
 
@@ -243,8 +265,33 @@ async def _run_tool_loop(
         if recovered:
             console.print(f"[dim]  [{label}] recovered a text-embedded tool call: {calls[0][0]}[/dim]")
 
-        # Agent wants to call one or more tools
-        messages.append(response.message)
+        # Apply the write sandbox before anything touches disk.
+        if write_sandbox:
+            fixed = []
+            for name, args in calls:
+                if name in _WRITE_TOOLS and isinstance(args, dict) and args.get("path"):
+                    safe = _sandbox_path(args["path"], write_sandbox)
+                    if safe != args["path"]:
+                        console.print(f"[dim]  [{label}] write path sandboxed → {safe}[/dim]")
+                        args = {**args, "path": safe}
+                fixed.append((name, args))
+            calls = fixed
+
+        # Record the assistant turn. For recovered calls, synthesise a proper
+        # tool_calls structure so the model sees the call as *made* on the next
+        # round instead of repeating it.
+        if recovered:
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": n, "arguments": a}}
+                    for n, a in calls
+                ],
+            })
+        else:
+            messages.append(response.message)
+
         for name, args in calls:
             if not isinstance(args, dict):
                 args = {}
@@ -259,6 +306,11 @@ async def _run_tool_loop(
                 console.print(f"[red]Tool error: {exc}[/red]")
 
             messages.append({"role": "tool", "content": result_text, "name": name})
+
+        # A one-shot agent (Writer/Healer) is done the moment its required tool
+        # has fired — keep looping and it just repeats itself.
+        if require_tool and any(n in require_tool for n, _ in tool_calls_made):
+            return response.message.content or "", tool_calls_made
 
     # Max rounds hit - ask for final summary with no tools
     final = await ollama_client.chat(model=model, messages=messages, options={"num_ctx": 16384})
@@ -307,6 +359,10 @@ def _python_content_problem(source: str) -> str | None:
     return "file has no runnable statements (no function, call, import, loop or assignment)"
 
 
+def _ensure_workspace() -> None:
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 # -- WRITER AGENT -- #
 async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, str | None]:
     """
@@ -318,6 +374,7 @@ async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, st
     structurally broken code (e.g. mangled indentation).
     """
     console.print(Rule("[bold cyan]Writer agent[/bold cyan]"))
+    _ensure_workspace()
 
     response_text = ""
     saved_filename = None
@@ -337,7 +394,7 @@ async def run_writer(sessions, ollama_tools, user_request: str) -> tuple[str, st
         ]
         response_text, tool_calls = await _run_tool_loop(
             sessions, ollama_tools, messages, WRITER_MODEL, "Writer",
-            require_tool={"write_file"},
+            require_tool={"write_file"}, write_sandbox=WORKSPACE_NAME,
         )
 
         saved_content = None
@@ -386,10 +443,10 @@ async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
     Reviewer Agent: Read the written file, critique it, write a .review.md file.
     """
     console.print(Rule("[bold magenta]Reviewer agent[/bold magenta]"))
+    _ensure_workspace()
 
-    # Path-aware: filename.rsplit(".", 1) breaks on a dot in a parent directory
-    # (e.g. "pkg.v2/main.py" -> "pkg"). with_suffix only touches the final component.
-    review_file = str(Path(filename).with_suffix(".review.md"))
+    # Keep the review beside the source, inside the workspace sandbox.
+    review_file = f"{WORKSPACE_NAME}/{Path(filename).with_suffix('.review.md').name}"
 
     messages = [
         {
@@ -411,11 +468,26 @@ async def run_reviewer(sessions, ollama_tools, filename: str) -> None:
             "content": f"Please review the file: {filename}"
         }
     ]
-    response_text, _ = await _run_tool_loop(sessions, ollama_tools, messages, REVIEWER_MODEL, "Reviewer")
+    response_text, tool_calls = await _run_tool_loop(
+        sessions, ollama_tools, messages, REVIEWER_MODEL, "Reviewer",
+        require_tool={"write_file"}, write_sandbox=WORKSPACE_NAME,
+    )
 
     console.print("\n[bold magenta]Reviewer:[/bold magenta]")
     console.print(Markdown(response_text or "*No commentary.*"))
-    console.print(f"\n[green]✓ Review saved to [bold]{review_file}[/bold][/green]")
+
+    wrote_review = any(
+        name == "write_file" and isinstance(args, dict)
+        and Path(str(args.get("path", ""))).name == Path(review_file).name
+        for name, args in tool_calls
+    )
+    if wrote_review and await _file_exists(sessions, review_file):
+        console.print(f"\n[green]✓ Review saved to [bold]{review_file}[/bold][/green]")
+    else:
+        console.print(
+            f"\n[yellow]⚠ No review file was written — the Reviewer model "
+            f"({REVIEWER_MODEL}) did not call write_file. Its critique (if any) is above.[/yellow]"
+        )
 
 async def _file_exists(sessions: dict, filename: str) -> bool:
     """Ground-truth check via the filesystem MCP server, not model claims."""
@@ -433,16 +505,15 @@ async def _run_and_capture(sessions: dict, run_cmd: str) -> tuple[bool, str]:
     if is_error:
         return False, raw
 
-    success = False
     for line in raw.splitlines():
         if line.startswith("Exit code:"):
             try:
-                code = int(line.split(":", 1)[1].strip())
-                success = (code == 0)
+                return int(line.split(":", 1)[1].strip()) == 0, raw
             except ValueError:
-                pass
-            break
-    return success, raw
+                break
+    # No parseable exit code — the run_command output format must have changed.
+    # Treat as failure but make the reason visible instead of silently looping.
+    return False, raw + "\n[warning: could not find an 'Exit code:' line to verify success]"
 
 
 HEAL_SYSTEM_PROMPT = (
@@ -488,7 +559,7 @@ async def _heal_once(
         _, tool_calls = await _run_tool_loop(
             sessions, healer_tools, messages, HEALER_MODEL,
             f"Heal-{attempt}.{retry}", max_rounds=5,
-            require_tool={"write_file", "edit_file"},
+            require_tool={"write_file", "edit_file"}, write_sandbox=WORKSPACE_NAME,
         )
 
         wrote_target = any(
@@ -736,46 +807,53 @@ async def main():
 
                     # Interactive Terminal Loop
                     while True:
-                        raw = console.input("\n[bold blue]You:[/bold blue]")
-                        if raw.lower().strip() in ("exit", "quit"):
+                        try:
+                            raw = console.input("\n[bold blue]You:[/bold blue]")
+                        except (EOFError, KeyboardInterrupt):
+                            console.print("\n[dim]Bye.[/dim]")
                             break
 
-                        # Pin commands
-                        if raw == "+pins":
-                            console.print(_pin_list())
+                        stripped = raw.strip()
+                        if stripped.lower() in ("exit", "quit"):
+                            break
+                        if not stripped:
                             continue
 
-                        if raw.startswith("+pin "):
-                            console.print(_pin_add(raw.removeprefix("+pin ").strip()))
-                            continue
-
-                        if raw.startswith("+unpin "):
-                            console.print(_pin_remove(raw.removeprefix("+unpin ").strip()))
-                            continue
-
-                        # Review Mode
-                        if raw.lstrip().startswith("--review"):
-                            user_request = raw.lstrip().removeprefix("--review").strip()
-                            if not user_request:
-                                console.print("[yellow]Please describe what you want to build.[/yellow]")
-                                continue
-                            await review_mode(all_sessions, all_tools, user_request)
-                            continue
-
-                        elif raw.startswith("--run"):
-                            request = raw.removeprefix("--run").strip()
-                            if not request:
-                                console.print("[yellow]Usage: --run <what to build>[/yellow]")
-                                continue
-                            await run_mode(all_sessions, all_tools, request)
-
-                        else:
-                            # Normal conversational/agentic mode
-                            messages.append({"role": "user", "content": raw})
-                            output, _ = await _run_tool_loop(all_sessions, all_tools, _build_messages(messages), CHAT_MODEL, "Chat")
-
-                            console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
-                            console.print(Markdown(output or "No response."))
+                        # One bad turn should not tear down the whole session.
+                        try:
+                            if stripped == "+pins":
+                                console.print(_pin_list())
+                            elif stripped.startswith("+pin "):
+                                console.print(_pin_add(stripped.removeprefix("+pin ").strip()))
+                            elif stripped.startswith("+unpin "):
+                                console.print(_pin_remove(stripped.removeprefix("+unpin ").strip()))
+                            elif stripped == "--review" or stripped.startswith("--review "):
+                                request = stripped.removeprefix("--review").strip()
+                                if not request:
+                                    console.print("[yellow]Usage: --review <what to build>[/yellow]")
+                                else:
+                                    await review_mode(all_sessions, all_tools, request)
+                            elif stripped == "--run" or stripped.startswith("--run "):
+                                request = stripped.removeprefix("--run").strip()
+                                if not request:
+                                    console.print("[yellow]Usage: --run <what to build>[/yellow]")
+                                else:
+                                    await run_mode(all_sessions, all_tools, request)
+                            else:
+                                # Normal conversational/agentic mode
+                                messages.append({"role": "user", "content": raw})
+                                output, _ = await _run_tool_loop(
+                                    all_sessions, all_tools, _build_messages(messages), CHAT_MODEL, "Chat"
+                                )
+                                console.print("\n[bold magenta]Coding Partner:[/bold magenta]")
+                                console.print(Markdown(output or "No response."))
+                        except KeyboardInterrupt:
+                            console.print("\n[yellow]Interrupted — back to the prompt.[/yellow]")
+                        except Exception as turn_exc:  # noqa: BLE001 - keep the REPL alive
+                            console.print(Panel(
+                                f"[bold red]{type(turn_exc).__name__}:[/bold red] {turn_exc}",
+                                title="That request failed", border_style="red",
+                            ))
     except Exception as exc:
         console.print(f"[bold red]Failed to start:[/bold red] {type(exc).__name__}: {exc}")
         if hasattr(exc, "exceptions"):
