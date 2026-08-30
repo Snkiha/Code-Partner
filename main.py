@@ -49,7 +49,7 @@ def _load_config() -> None:
     import, and again by cli() after flags have been merged into os.environ."""
     global CODER_MODEL, WRITER_MODEL, REVIEWER_MODEL, HEALER_MODEL, CHAT_MODEL
     global MAX_HEAL_ROUNDS, HEAL_WRITE_RETRIES, AUTO_PULL
-    global PROJECT_DIR, WORKSPACE_NAME, WORKSPACE_DIR, FS_SERVER_PKG
+    global PROJECT_DIR, WORKSPACE_NAME, WORKSPACE_DIR, FS_SERVER_CMD
     global server_params, bash_server_params
 
     # One capable coder model backs Writer / Reviewer / Healer — and Chat too by
@@ -74,13 +74,18 @@ def _load_config() -> None:
     WORKSPACE_NAME = _env("CP_WORKSPACE", "workspace")
     WORKSPACE_DIR  = PROJECT_DIR / WORKSPACE_NAME
 
-    # Pinned so an `npx` run can't silently upgrade the filesystem server and
-    # drift its tool names/behaviour underneath us.
-    FS_SERVER_PKG = _env("CP_FS_SERVER_PKG", "@modelcontextprotocol/server-filesystem@2026.7.10")
-
+    # How to launch the MCP filesystem server. Pinned version so an `npx` run
+    # can't silently upgrade it and drift its tool names. The Docker image
+    # pre-installs it and sets this to the plain binary (no network at runtime).
+    # PROJECT_DIR is always appended as the final argument.
+    FS_SERVER_CMD = _env(
+        "CP_FS_SERVER_CMD",
+        "npx -y @modelcontextprotocol/server-filesystem@2026.7.10",
+    )
+    _fs_parts = shlex.split(FS_SERVER_CMD)
     server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", FS_SERVER_PKG, str(PROJECT_DIR)],
+        command=_fs_parts[0],
+        args=[*_fs_parts[1:], str(PROJECT_DIR)],
     )
     # sys.executable, not a PATH lookup: shutil.which("python") can resolve to a
     # different interpreter (Windows Store alias, another install) that lacks
